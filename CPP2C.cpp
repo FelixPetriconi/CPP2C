@@ -52,7 +52,7 @@ struct OutputStreams
 };
 
 vector<string> ClassList = {
-  "Rect2D_", "BreastGeometry", "IPoint2D", "vector<IPoint2D>"
+  "ICalcification"
 };
 
 map<string, int> funcList;
@@ -79,6 +79,8 @@ public:
 
   CType determineCType(const QualType &qt)
   {
+    // How to get fuul name with namespace 
+    // QualType::getAsString(cl->getASTContext().getTypeDeclType(const_cast<CXXRecordDecl*>(cl)).split())
     CType result;
     // if it is build-in type use it as is
     if (qt->isBuiltinType() ||
