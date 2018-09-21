@@ -194,145 +194,158 @@ public:
         result.isPointer = true;
       }
     }
-    //else if ((qt->isReferenceType() || qt->isPointerType()) &&
-    //         qt->getPointeeType()->isRecordType())
-    //{
-    //  result.isPointer = true; // to properly differentiate among cast types
-    //  const CXXRecordDecl *crd = qt->getPointeeType()->getAsCXXRecordDecl();
-    //  string recordName = crd->getNameAsString();
-
-    //  if (std::find(ClassList.begin(), ClassList.end(), recordName) !=
-    //      ClassList.end())
-    //  {
-    //    result.mappedType = "W" + recordName + "*";
-    //    result.castType = recordName + "*";
-    //  }
-    //  else
-    //  {
-    //    result.mappedType = recordName + "*";
-    //  }
-    //}
     return result;
   }
 
   void run(const MatchFinder::MatchResult &Result) override
   {
-    if (const CXXRecordDecl *crd = Result.Nodes.getNodeAs<CXXRecordDecl>("derivedClassDecl"))
-    {
-      auto bases = crd->bases();
-      auto baseClass = *bases.begin();
+    static bool passed = false;
+    if (passed)
+      return;
 
-      string className = baseClass.getType()->getAsCXXRecordDecl()->getNameAsString();
-    }
-    else if (const CXXMethodDecl *cmd = Result.Nodes.getNodeAs<CXXMethodDecl>("publicMethodDecl"))
+    if (const CXXRecordDecl *crd = Result.Nodes.getNodeAs<CXXRecordDecl>("classDecl"))
     {
-      string mappedFunctionName;
-      string className = cmd->getParent()->getDeclName().getAsString();
-      string mappedClassName = createNewClassName(className);
-
       std::stringstream functionBody;
       std::stringstream destructorBody;
       std::stringstream constructorBody;
       std::stringstream functionSignature;
 
-      // ignore operator overloadings
-      if (cmd->isOverloadedOperator())
-        return;
+      const auto originalClassName = crd->getNameAsString();
+      const auto newClassName = createNewClassName(originalClassName);
 
-      // constructor
-      if (const CXXConstructorDecl *ccd = dyn_cast<CXXConstructorDecl>(cmd))
+      OS.HeaderOS <<
+        "struct __declspec(dllexport) " << newClassName << "\n"
+        "{\n"
+        "  static " << newClassName << "*(*constructor)(const void*);\n"
+        "  static void(*destructor)(" << newClassName << "*);\n"
+        "\n";
+
+      if (crd->getNumBases() != 0)
       {
-        //if (ccd->isCopyConstructor() || ccd->isMoveConstructor())
-        //  return;
-        //mappedFunctionName = "_create";
-        //returnType = "W" + className + "*";
-        //self = "";
-        //separator = "";
-        //functionBody << "  return reinterpret_cast<" << returnType << ">( new " << className << "(";
-        //bodyEnd += "))";
+        auto bases = crd->bases();
+        auto baseClass = *bases.begin();
+
+        const auto originalBaseClassName = baseClass.getType()->getAsCXXRecordDecl()->getNameAsString();
+        const auto newBaseClassName = createNewClassName(originalBaseClassName);
+
+        OS.HeaderOS <<
+          "  " << newBaseClassName << "* base;\n";
+
+        constructorBody <<
+          "  const auto originalBase = reinterpret_cast<const " << originalClassName << "*>(origin);\n"
+          "  result->base = " << newBaseClassName << "_create(dynamic_cast<const " << originalBaseClassName << "*>(originalBase))\n";
+
+        destructorBody << "  " << newBaseClassName << "_destroy(val->base);\n";
       }
-      else if (isa<CXXDestructorDecl>(cmd))
-      {
-        //mappedFunctionName = "_destroy";
-        //returnType = "void";
-        //functionBody << "  delete reinterpret_cast<" << className << "*>(self)";
-      }
-      else
-      {
-        mappedFunctionName = cmd->getNameAsString();
-        mappedFunctionName[0] = tolower(mappedFunctionName[0]);
 
-        const QualType qt = cmd->getReturnType();
-        auto cType = determineCType(qt);
+      OS.BodyOS <<
+        newClassName << "*(*" << newClassName << "::constructor)(const void*) = &" << newClassName << "_create;\n"
+        "void(*" << newClassName << "::destructor)(" << newClassName << "*) = &" << newClassName << "_destroy;\n"
+        "\n" <<
+        "DEFINE_VECTOR(" << newClassName << ")\n"
+        "\n" <<
+        newClassName << "* " << newClassName << "_create(const void* origin)\n"
+        "{\n"
+        "  auto result WSCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin";
 
-        if (cType.isPointer)
+      // Loop over public functions
+      for (const auto& method : crd->methods())
+      {
+        if (!method->isExternallyVisible())
+          continue;
+
+        string mappedFunctionName;
+
+        // ignore operator overloadings
+        if (method->isOverloadedOperator())
+          continue;
+
+        // constructor
+        if (const CXXConstructorDecl *ccd = dyn_cast<CXXConstructorDecl>(method))
         {
-          functionSignature <<
-            "  const " << cType.mappedType << "* " << mappedFunctionName << ";\n";
+          //if (ccd->isCopyConstructor() || ccd->isMoveConstructor())
+          //  return;
+          //mappedFunctionName = "_create";
+          //returnType = "W" + className + "*";
+          //self = "";
+          //separator = "";
+          //functionBody << "  return reinterpret_cast<" << returnType << ">( new " << className << "(";
+          //bodyEnd += "))";
+        }
+        else if (isa<CXXDestructorDecl>(method))
+        {
+          //mappedFunctionName = "_destroy";
+          //returnType = "void";
+          //functionBody << "  delete reinterpret_cast<" << className << "*>(self)";
         }
         else
         {
-          functionSignature <<
-            "  " << cType.mappedType << " " << mappedFunctionName << ";\n";
-        }
+          mappedFunctionName = method->getNameAsString();
+          mappedFunctionName[0] = tolower(mappedFunctionName[0]);
 
-        constructorBody << ",\n"
-          "    &" << className << "::" << cmd->getNameAsString() << ", &" << mappedClassName << "::" << mappedFunctionName;
+          const QualType qt = method->getReturnType();
+          auto cType = determineCType(qt);
 
-        if (cType.isPointer)
-        {
-          if (cType.mappedType == "const char*")
+          if (cType.isPointer)
           {
-            destructorBody << "  delete [] " << mappedFunctionName << ";\n";
-          }
-          else if (cType.isVector)
-          {
-            destructorBody << "  " << cType.mappedType << "_destroy(val->" << mappedFunctionName << ");\n";
+            OS.HeaderOS <<
+              "  const " << cType.mappedType << "* " << mappedFunctionName << ";\n";
           }
           else
           {
-            destructorBody << "  delete " << mappedFunctionName << ";\n";
+            OS.HeaderOS <<
+              "  " << cType.mappedType << " " << mappedFunctionName << ";\n";
           }
+
+          OS.BodyOS << ",\n"
+            "    &" << originalClassName << "::" << method->getNameAsString() << ", &" << newClassName << "::" << mappedFunctionName;
+
+          if (cType.isPointer)
+          {
+            if (cType.mappedType == "char")
+            {
+              destructorBody << "  delete [] " << mappedFunctionName << ";\n";
+            }
+            else if (cType.isVector)
+            {
+              destructorBody << "  " << cType.mappedType << "_destroy(val->" << mappedFunctionName << ");\n";
+            }
+            else
+            {
+              destructorBody << "  delete " << mappedFunctionName << ";\n";
+            }
+          }
+        }
+
+        if (method->getNumParams() > 1)
+        {
+          OS.HeaderOS << "/* FIXME function with parameter */" << mappedFunctionName << "\n";
         }
       }
 
-      if (cmd->getNumParams() > 1)
-      {
-        OS.HeaderOS << "/* FIXME function with parameter */" << mappedFunctionName << "\n";
-      }
+      OS.HeaderOS <<
+        "};\n"
+        "\n"
+        "" <<
+        "__declspec(dllexport) " << newClassName << "* " << newClassName << "_create(const void* origin);\n"
+        "__declspec(dllexport) void " << newClassName << "_destroy(" << newClassName << "* val);\n"
+        "\n"
+        "DECLARE_VECTOR(" << newClassName << ")\n";
 
-      OS.HeaderOS << functionSignature.str();
-      OS.destructorString += destructorBody.str();
-
-      OS.BodyOS << constructorBody.str();
+      OS.BodyOS <<
+        ");\n" <<
+        constructorBody.str() << 
+        "  return result;\n"
+        "}\n"
+        "\n"
+        "void " << newClassName << "_destroy(" << newClassName << "* val)\n" <<
+        "{\n" <<
+        destructorBody.str() <<
+        "  delete val;\n"
+        "}\n";
+      passed = true;
     }
   }
-
-  /*string createMappedParameterInvocation(const CXXMethodDecl* cmd)
-  {
-    stringstream result;
-    string separator = ", ";
-    for (unsigned int i = 0; i < cmd->getNumParams(); i++)
-    {
-      const QualType qt = cmd->parameters()[i]->getType();
-      auto cType = determineCType(qt);
-
-      if (i != 0)
-        result << separator;
-
-      if (cType.castType.empty())
-        result << cmd->parameters()[i]->getQualifiedNameAsString();
-      else
-      {
-        if (!cType.isPointer)
-          result << "*";
-        result << "reinterpret_cast<" << cType.castType << ">("
-          << cmd->parameters()[i]->getQualifiedNameAsString()
-          << ")";
-      }
-    }
-    return result.str();
-  }*/
 
   virtual void onEndOfTranslationUnit()
   {
@@ -356,83 +369,12 @@ public:
   {
     // Add a simple matcher for finding 'if' statements.
 
-    for (const auto &className : ClassList)
-    {
-      auto newClassName = createNewClassName(className);
-      OS.HeaderOS <<
-        "struct __declspec(dllexport) " << newClassName << "\n"
-        "{\n"
-        "  static " << newClassName << "*(*constructor)(const void*);\n"
-        "  static void(*destructor)(" << newClassName << "*);\n"
-        "\n";
 
-        OS.BodyOS <<
-          newClassName << "*(*" << newClassName << "::constructor)(const void*) = &" << newClassName << "_create;\n"
-          "void(*" << newClassName << "::destructor)(" << newClassName << "*) = &" << newClassName << "_destroy;\n"
-          "\n" <<
-          "DEFINE_VECTOR(" << newClassName << ")\n"
-          "\n" <<
-          newClassName << "* " << newClassName << "_create(const void* origin)\n"
-          "{\n"
-          "  return WSCR::createWrappedObject<" << className << ", " << newClassName << ">(origin";
+    DeclarationMatcher classMatcher =
+      cxxRecordDecl(hasName(ClassList[0])).bind("classDecl");
 
 
-      //if (className.find("vector") != std::string::npos)
-      //{
-      //  auto openBrace = className.find("<");
-      //  auto closeBrace = className.find(">");
-      //  auto templateParam = className.substr(openBrace + 1, closeBrace - openBrace - 1);
-      //  string vectorName = "vectorW" + templateParam;
-      //  OS.HeaderOS << "struct __declspec(dllexport) " << vectorName <<
-      //    "{\n" <<
-      //    "  W" << templateParam << "* values;\n" <<
-      //    "  unsigned int size;\n" <<
-      //    "};\n\n" <<
-      //    "__declspec(dllexport) " << vectorName << "* " << vectorName << "_create(); \n" <<
-      //    "__declspec(dllexport) void " << vectorName << "_destroy(" << vectorName << "*val);\n\n";
-
-      //  OS.BodyOS << vectorName << "* " << vectorName << "_create()\n" <<
-      //    "{\n" <<
-      //    "  " << vectorName << "* result = new " << vectorName << "();\n"
-      //    "  result->values = nullptr;\n" <<
-      //    "  result->size = 0;\n" <<
-      //    "  return result; \n" <<
-      //    "}\n\n" <<
-      //    "void " << vectorName << "_destroy(" << vectorName << "* val)" <<
-      //    "{\n" <<
-      //    "  if (val) delete [] val->values;\n" << 
-      //    "  delete val;\n" <<
-      //    "}\n\n";
-      //}
-      //else if (className == "IPoint2D")
-      //{
-      //  OS.HeaderOS << "struct __declspec(dllexport) WIPoint2D" << 
-      //    "{\n" <<
-      //    "  int X;\n" <<
-      //    "  int Y;\n" <<
-      //    "};\n\n" <<
-      //    "__declspec(dllexport) WIPoint2D* WIPoint2D_create();\n" <<
-      //    "__declspec(dllexport) void WIPoint2D_destroy(WIPoint2D* val);\n\n";
-
-      //  OS.BodyOS << "WIPoint2D * WIPoint2D_create()\n" <<
-      //    "{\n" <<
-      //    "  return new WIPoint2D();\n"
-      //    "}\n\n" <<
-      //    "void WIPoint2D_destroy(WIPoint2D* val)\n" <<
-      //    "{\n" <<
-      //    "  delete val;\n" <<
-      //    "}\n\n";
-
-      DeclarationMatcher classMatcher =
-        cxxMethodDecl(isPublic(), ofClass(hasName(className)))
-        .bind("publicMethodDecl");
-
-      DeclarationMatcher derivedClassMatcher =
-        cxxRecordDecl(isDerivedFrom(hasName("IFinding")/*anything()*/)).bind("derivedClassDecl");
-
-      Matcher.addMatcher(classMatcher, &HandlerForClassMatcher);
-      Matcher.addMatcher(derivedClassMatcher, &HandlerForClassMatcher);
-    }
+    Matcher.addMatcher(classMatcher, &HandlerForClassMatcher);
   }
 
   void HandleTranslationUnit(ASTContext &Context) override
@@ -502,9 +444,9 @@ public:
       "///////////////////////////////////////////////////////////////////\n"
       "\n"
       "#include \"" << _headerFileName << "\"\n"
+      "#include \"TemplateHelper.h\"\n"
       "\n"
       "#include <R2MgCadSr/" << _originalIncludeFileName << ">\n"
-      "#include \"TemplateHelper.h\"\n"
       "\n"
       "using namespace R2::Citra::Mammo::Decoding;\n"
       "\n";
@@ -535,13 +477,6 @@ public:
     }
 
     OS.HeaderOS <<
-      "};\n"
-      "\n"
-      "" << 
-      "__declspec(dllexport) " << _className << "* " << _className << "_create(const void* origin);\n"
-      "__declspec(dllexport) void " << _className << "_destroy(" << _className << "* va);\n"
-      "\n"
-      "DECLARE_VECTOR(" << _className << ")\n"
       "\n"
       "#ifdef __cplusplus\n"
       "}\n"
@@ -549,15 +484,7 @@ public:
       "\n"
       "#endif /* _" << toUpper(_className) << "_ */\n";
 
-    OS.BodyOS <<
-      ");\n"
-      "}\n"
-      "\n"
-      "void " << _className << "_destroy(" << _className << "* val)\n" <<
-      "{\n" << 
-      OS.destructorString <<
-      "  delete val;\n"
-      "}\n";
+    //OS.BodyOS <<
 
     OS.HeaderOS.flush();
     OS.BodyOS.flush();
