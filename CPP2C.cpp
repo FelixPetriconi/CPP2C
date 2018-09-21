@@ -11,14 +11,16 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Signals.h"
+#include "clang/Frontend/CompilerInstance.h"
 
 #include "clang/Driver/Options.h"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <sstream>
-#include <tuple>
 #include <vector>
-#include "clang/Frontend/CompilerInstance.h"
+#include <locale>
+
 
 using namespace std;
 using namespace clang;
@@ -26,6 +28,64 @@ using namespace clang::driver;
 using namespace clang::tooling;
 using namespace clang::ast_matchers;
 using namespace llvm;
+
+
+string toUpper(string strToConvert)
+{
+  std::transform(strToConvert.begin(), strToConvert.end(), strToConvert.begin(), ::toupper);
+  return strToConvert;
+}
+
+template<class Container, class SourceContainer>
+bool appendUniqueValues(Container& c, const SourceContainer& newValues)
+{
+  auto result = false;
+  for (const auto& v : newValues)
+  {
+    result = appendUnique(c, v) || result;
+  }
+  return result;
+}
+
+template<class Container, typename T>
+bool appendUnique(Container& c, const T& v)
+{
+  if (std::find(std::begin(c), std::end(c), v) == std::end(c))
+  {
+    c.push_back(v);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Appends element to the specified container if it not already available which is
+ * checked by a predicate
+ * @param c that supports a range specified by the begin() and end() ForwardIterators
+ * @param value that will be append to the container
+ * @param p UnaryPredicate that is used for equality check
+ * @return true if it was appended, otherwise false
+ */
+template<class Container, typename T, class Predicate>
+bool appendUnique(Container& c, T value, Predicate p)
+{
+  if (std::find_if(std::begin(c), std::end(c), p) == std::end(c))
+  {
+    c.push_back(std::move(value));
+    return true;
+  }
+  return false;
+}
+
+string createNewClassName(string oldName)
+{
+  if (oldName[0] == 'I')
+    oldName = oldName.substr(1);
+
+  return "W" + oldName;
+}
+
+string currentFile;
 
 /** Options **/
 static cl::OptionCategory CPP2CCategory("CPP2C options");
@@ -38,6 +98,7 @@ struct OutputStreams
 {
   string headerString;
   string bodyString;
+  string destructorString;
 
   llvm::raw_string_ostream HeaderOS;
   llvm::raw_string_ostream BodyOS;
@@ -52,10 +113,8 @@ struct OutputStreams
 };
 
 vector<string> ClassList = {
-  "ICalcification"
+  //"IAnalysesPerformed"
 };
-
-map<string, int> funcList;
 
 /** Matchers **/
 
@@ -71,15 +130,13 @@ public:
   struct CType
   {
     string mappedType;
-    string castType; // whether this should be casted or not
     bool isPointer = false;
-    bool shouldReturn = true;
-    bool additionalParameter = false;
+    bool isVector = false;
   };
 
   CType determineCType(const QualType &qt)
   {
-    // How to get fuul name with namespace 
+    // How to get full name with namespace 
     // QualType::getAsString(cl->getASTContext().getTypeDeclType(const_cast<CXXRecordDecl*>(cl)).split())
     CType result;
     // if it is build-in type use it as is
@@ -87,86 +144,96 @@ public:
         (qt->isPointerType() && qt->getPointeeType()->isBuiltinType()))
     {
       result.mappedType = qt.getAsString();
-      if (qt->isVoidType())
-        result.shouldReturn = false;
+      //if (qt->isVoidType())
+      //  result.shouldReturn = false;
       // if it is a CXXrecordDecl then return a pointer to WName*
     }
     else if (qt->isEnumeralType())
     {
       auto enumType = qt->getAs<EnumType>()->getDecl();
-      result.mappedType = enumType->getNameAsString();
+      result.mappedType = "W" + enumType->getNameAsString();
     }
-    else if (qt->isRecordType()) // class or struct
+    else if (qt->isRecordType() || (qt->isReferenceType() || qt->isPointerType()) &&
+      qt->getPointeeType()->isRecordType()) // class or struct
     {
-      const CXXRecordDecl *crd = qt->getAsCXXRecordDecl();
+      const CXXRecordDecl *crd = 
+        ((qt->isReferenceType() || qt->isPointerType()) && qt->getPointeeType()->isRecordType()) 
+          ? qt->getPointeeType()->getAsCXXRecordDecl() : qt->getAsCXXRecordDecl();
+
       string recordName = crd->getNameAsString();
       if (recordName == "basic_string")
       {
-        result.mappedType = "const char*";
-        result.castType = result.mappedType;
+        result.mappedType = "char";
         result.isPointer = true;
       }
       else if (recordName == "vector")
       {
-        result.mappedType = "vectorWIPoint2D";
-        result.castType = result.mappedType;
-        result.isPointer = true;
-        result.additionalParameter = true;
-        /*
+        string valueTypeName;
         auto tcrd = dyn_cast<ClassTemplateSpecializationDecl>(crd);
         const auto &templateArgument = tcrd->getTemplateArgs().asArray()[0];
-        const auto &baseType = templateArgument.getAsType().getTypePtr()->getAsCXXRecordDecl();
-        const auto &name = baseType->getName();
-        */
-      }
-      else if (recordName == "Point2D")
-      {
-        result.mappedType = "WIPoint2D";
-        result.isPointer = true;
-        result.castType = result.mappedType;
-      }
-      else
-      {
-        result.mappedType = "W" + recordName + "*";
-        result.castType = recordName + "*";
-        result.additionalParameter = true;
-      }
-    }
-    else if ((qt->isReferenceType() || qt->isPointerType()) &&
-             qt->getPointeeType()->isRecordType())
-    {
-      result.isPointer = true; // to properly differentiate among cast types
-      const CXXRecordDecl *crd = qt->getPointeeType()->getAsCXXRecordDecl();
-      string recordName = crd->getNameAsString();
+        const auto &asType = templateArgument.getAsType();
+        const auto &asTypePtr = asType.getTypePtr();
+        if (asTypePtr->isPointerType())
+        {
+          const auto &baseType = asTypePtr->getPointeeType()->getAsCXXRecordDecl();
+          valueTypeName = baseType->getName();
+        }
+        else
+        {
+          const auto &baseType = asTypePtr->getAsCXXRecordDecl();
+          valueTypeName = baseType->getName();
+        }
 
-      if (std::find(ClassList.begin(), ClassList.end(), recordName) !=
-          ClassList.end())
-      {
-        result.mappedType = "W" + recordName + "*";
-        result.castType = recordName + "*";
+        result.mappedType = "vector_" + createNewClassName(valueTypeName);
+        result.isPointer = true;
+        result.isVector = true;
       }
       else
       {
-        result.mappedType = recordName + "*";
+        result.mappedType = createNewClassName(recordName);
+        result.isPointer = true;
       }
     }
+    //else if ((qt->isReferenceType() || qt->isPointerType()) &&
+    //         qt->getPointeeType()->isRecordType())
+    //{
+    //  result.isPointer = true; // to properly differentiate among cast types
+    //  const CXXRecordDecl *crd = qt->getPointeeType()->getAsCXXRecordDecl();
+    //  string recordName = crd->getNameAsString();
+
+    //  if (std::find(ClassList.begin(), ClassList.end(), recordName) !=
+    //      ClassList.end())
+    //  {
+    //    result.mappedType = "W" + recordName + "*";
+    //    result.castType = recordName + "*";
+    //  }
+    //  else
+    //  {
+    //    result.mappedType = recordName + "*";
+    //  }
+    //}
     return result;
   }
 
   void run(const MatchFinder::MatchResult &Result) override
   {
-    if (const CXXMethodDecl *cmd = Result.Nodes.getNodeAs<CXXMethodDecl>("publicMethodDecl"))
+    if (const CXXRecordDecl *crd = Result.Nodes.getNodeAs<CXXRecordDecl>("derivedClassDecl"))
+    {
+      auto bases = crd->bases();
+      auto baseClass = *bases.begin();
+
+      string className = baseClass.getType()->getAsCXXRecordDecl()->getNameAsString();
+    }
+    else if (const CXXMethodDecl *cmd = Result.Nodes.getNodeAs<CXXMethodDecl>("publicMethodDecl"))
     {
       string mappedFunctionName;
       string className = cmd->getParent()->getDeclName().getAsString();
-      string returnType;
-      string returnCast;
-      string self = "W" + className + "* self";
-      string separator = ", ";
-      string bodyEnd;
-      string additionalParameter;
+      string mappedClassName = createNewClassName(className);
 
       std::stringstream functionBody;
+      std::stringstream destructorBody;
+      std::stringstream constructorBody;
+      std::stringstream functionSignature;
 
       // ignore operator overloadings
       if (cmd->isOverloadedOperator())
@@ -175,112 +242,73 @@ public:
       // constructor
       if (const CXXConstructorDecl *ccd = dyn_cast<CXXConstructorDecl>(cmd))
       {
-        if (ccd->isCopyConstructor() || ccd->isMoveConstructor())
-          return;
-        mappedFunctionName = "_create";
-        returnType = "W" + className + "*";
-        self = "";
-        separator = "";
-        functionBody << "  return reinterpret_cast<" << returnType << ">( new " << className << "(";
-        bodyEnd += "))";
+        //if (ccd->isCopyConstructor() || ccd->isMoveConstructor())
+        //  return;
+        //mappedFunctionName = "_create";
+        //returnType = "W" + className + "*";
+        //self = "";
+        //separator = "";
+        //functionBody << "  return reinterpret_cast<" << returnType << ">( new " << className << "(";
+        //bodyEnd += "))";
       }
       else if (isa<CXXDestructorDecl>(cmd))
       {
-        mappedFunctionName = "_destroy";
-        returnType = "void";
-        functionBody << "  delete reinterpret_cast<" << className << "*>(self)";
+        //mappedFunctionName = "_destroy";
+        //returnType = "void";
+        //functionBody << "  delete reinterpret_cast<" << className << "*>(self)";
       }
       else
       {
-        mappedFunctionName = "_" + cmd->getNameAsString();
-        const QualType qt = cmd->getReturnType();
-        
-        auto cType = determineCType(qt);
-        returnType = cType.mappedType;
+        mappedFunctionName = cmd->getNameAsString();
+        mappedFunctionName[0] = tolower(mappedFunctionName[0]);
 
-        if (cType.mappedType.find("vector") != std::string::npos)
+        const QualType qt = cmd->getReturnType();
+        auto cType = determineCType(qt);
+
+        if (cType.isPointer)
         {
-          returnType = returnType +"*";
-          additionalParameter = cType.castType;
-          functionBody << "  const auto& elements = reinterpret_cast<" << className << "*>(self)->" << cmd->getNameAsString() << "(" << createMappedParameterInvocation(cmd) << ");\n";
-          functionBody << "  result->values = new WIPoint2D[elements.size()];\n";
-          functionBody << "  result->size = static_cast<unsigned int>(elements.size());\n";
-          functionBody << "  std::transform(elements.cbegin(), elements.cend(), result->values, [](const IPoint2D& p) { return WIPoint2D{p.X, p.Y};};\n";
-          functionBody << "  return result";
+          functionSignature <<
+            "  const " << cType.mappedType << "* " << mappedFunctionName << ";\n";
         }
         else
         {
-          // should this function return?
-          if (cType.shouldReturn)
-            functionBody << "  return ";
+          functionSignature <<
+            "  " << cType.mappedType << " " << mappedFunctionName << ";\n";
+        }
 
-          if (!cType.castType.empty())
+        constructorBody << ",\n"
+          "    &" << className << "::" << cmd->getNameAsString() << ", &" << mappedClassName << "::" << mappedFunctionName;
+
+        if (cType.isPointer)
+        {
+          if (cType.mappedType == "const char*")
           {
-            // if not pointer and it needs to be casted, then return the pointer
-            if (!cType.isPointer)
-              functionBody << "&";
-
-            functionBody << "reinterpret_cast<" << cType.mappedType << ">(";
-            bodyEnd += ")";
+            destructorBody << "  delete [] " << mappedFunctionName << ";\n";
           }
-
-          // if Static call it properly
-          if (cmd->isStatic())
-            functionBody << className << "::" << cmd->getNameAsString() << "(";
-          // if not  use the passed object to call the method
+          else if (cType.isVector)
+          {
+            destructorBody << "  " << cType.mappedType << "_destroy(val->" << mappedFunctionName << ");\n";
+          }
           else
-            functionBody << "reinterpret_cast<" << className << "*>(self)->"
-            << cmd->getNameAsString() << "(";
-
-          bodyEnd += ")";
+          {
+            destructorBody << "  delete " << mappedFunctionName << ";\n";
+          }
         }
       }
 
-      std::stringstream functionSignature;
-      functionSignature << returnType << " " << className << mappedFunctionName;
-
-      auto it = funcList.find(functionSignature.str());
-
-      if (it != funcList.end())
+      if (cmd->getNumParams() > 1)
       {
-        it->second++;
-        functionSignature << "_" << it->second;
-      }
-      else
-      {
-        funcList[functionSignature.str()] = 0;
+        OS.HeaderOS << "/* FIXME function with parameter */" << mappedFunctionName << "\n";
       }
 
-     
-      functionSignature << "(" << self;
+      OS.HeaderOS << functionSignature.str();
+      OS.destructorString += destructorBody.str();
 
-      for (unsigned int i = 0; i < cmd->getNumParams(); i++)
-      {
-        const QualType qt = cmd->parameters()[i]->getType();
-        auto cType = //std::tie(returnType, returnCast, isPointer, shouldReturn) =
-          determineCType(qt);
-        functionSignature << separator << cType.mappedType << " ";
-        functionSignature << cmd->parameters()[i]->getQualifiedNameAsString() << "";
-
-        separator = ", ";
-      }
-      if (!additionalParameter.empty())
-        functionSignature << separator << additionalParameter << "* result";
-
-      functionSignature << ")";
-
-      string parameterInvocation = createMappedParameterInvocation(cmd);
-      functionBody << parameterInvocation;
-
-      OS.HeaderOS << "__declspec(dllexport) " << functionSignature.str() << ";\n\n";
-
-      OS.BodyOS << functionSignature.str() << "{\n";
-      OS.BodyOS << functionBody.str();
-      OS.BodyOS << bodyEnd << "; \n}\n\n";
+      OS.BodyOS << constructorBody.str();
     }
   }
 
-  string createMappedParameterInvocation(const CXXMethodDecl* cmd)
+  /*string createMappedParameterInvocation(const CXXMethodDecl* cmd)
   {
     stringstream result;
     string separator = ", ";
@@ -304,7 +332,7 @@ public:
       }
     }
     return result.str();
-  }
+  }*/
 
   virtual void onEndOfTranslationUnit()
   {
@@ -313,6 +341,7 @@ public:
 private:
   OutputStreams &OS;
 };
+
 
 /****************** /Member Functions *******************************/
 // Implementation of the ASTConsumer interface for reading an AST produced
@@ -327,63 +356,82 @@ public:
   {
     // Add a simple matcher for finding 'if' statements.
 
-    for (const string &className : ClassList)
+    for (const auto &className : ClassList)
     {
-      if (className.find("vector") != std::string::npos)
-      {
-        auto openBrace = className.find("<");
-        auto closeBrace = className.find(">");
-        auto templateParam = className.substr(openBrace + 1, closeBrace - openBrace - 1);
-        string vectorName = "vectorW" + templateParam;
-        OS.HeaderOS << "struct __declspec(dllexport) " << vectorName <<
-          "{\n" <<
-          "  W" << templateParam << "* values;\n" <<
-          "  unsigned int size;\n" <<
-          "};\n\n" <<
-          "__declspec(dllexport) " << vectorName << "* " << vectorName << "_create(); \n" <<
-          "__declspec(dllexport) void " << vectorName << "_destroy(" << vectorName << "*val);\n\n";
+      auto newClassName = createNewClassName(className);
+      OS.HeaderOS <<
+        "struct __declspec(dllexport) " << newClassName << "\n"
+        "{\n"
+        "  static " << newClassName << "*(*constructor)(const void*);\n"
+        "  static void(*destructor)(" << newClassName << "*);\n"
+        "\n";
 
-        OS.BodyOS << vectorName << "* " << vectorName << "_create()\n" <<
-          "{\n" <<
-          "  " << vectorName << "* result = new " << vectorName << "();\n"
-          "  result->values = nullptr;\n" <<
-          "  result->size = 0;\n" <<
-          "  return result; \n" <<
-          "}\n\n" <<
-          "void " << vectorName << "_destroy(" << vectorName << "* val)" <<
-          "{\n" <<
-          "  if (val) delete [] val->values;\n" << 
-          "  delete val;\n" <<
-          "}\n\n";
-      }
-      else if (className == "IPoint2D")
-      {
-        OS.HeaderOS << "struct __declspec(dllexport) WIPoint2D" << 
-          "{\n" <<
-          "  int X;\n" <<
-          "  int Y;\n" <<
-          "};\n\n" <<
-          "__declspec(dllexport) WIPoint2D* WIPoint2D_create();\n" <<
-          "__declspec(dllexport) void WIPoint2D_destroy(WIPoint2D* val);\n\n";
+        OS.BodyOS <<
+          newClassName << "*(*" << newClassName << "::constructor)(const void*) = &" << newClassName << "_create;\n"
+          "void(*" << newClassName << "::destructor)(" << newClassName << "*) = &" << newClassName << "_destroy;\n"
+          "\n" <<
+          "DEFINE_VECTOR(" << newClassName << ")\n"
+          "\n" <<
+          newClassName << "* " << newClassName << "_create(const void* origin)\n"
+          "{\n"
+          "  return WSCR::createWrappedObject<" << className << ", " << newClassName << ">(origin";
 
-        OS.BodyOS << "WIPoint2D * WIPoint2D_create()\n" <<
-          "{\n" <<
-          "  return new WIPoint2D();\n"
-          "}\n\n" <<
-          "void WIPoint2D_destroy(WIPoint2D* val)\n" <<
-          "{\n" <<
-          "  delete val;\n" <<
-          "}\n\n";
-      }
-      else
-      {
-        OS.HeaderOS << "struct __declspec(dllexport) W" << className << ";\n";
-      }
+
+      //if (className.find("vector") != std::string::npos)
+      //{
+      //  auto openBrace = className.find("<");
+      //  auto closeBrace = className.find(">");
+      //  auto templateParam = className.substr(openBrace + 1, closeBrace - openBrace - 1);
+      //  string vectorName = "vectorW" + templateParam;
+      //  OS.HeaderOS << "struct __declspec(dllexport) " << vectorName <<
+      //    "{\n" <<
+      //    "  W" << templateParam << "* values;\n" <<
+      //    "  unsigned int size;\n" <<
+      //    "};\n\n" <<
+      //    "__declspec(dllexport) " << vectorName << "* " << vectorName << "_create(); \n" <<
+      //    "__declspec(dllexport) void " << vectorName << "_destroy(" << vectorName << "*val);\n\n";
+
+      //  OS.BodyOS << vectorName << "* " << vectorName << "_create()\n" <<
+      //    "{\n" <<
+      //    "  " << vectorName << "* result = new " << vectorName << "();\n"
+      //    "  result->values = nullptr;\n" <<
+      //    "  result->size = 0;\n" <<
+      //    "  return result; \n" <<
+      //    "}\n\n" <<
+      //    "void " << vectorName << "_destroy(" << vectorName << "* val)" <<
+      //    "{\n" <<
+      //    "  if (val) delete [] val->values;\n" << 
+      //    "  delete val;\n" <<
+      //    "}\n\n";
+      //}
+      //else if (className == "IPoint2D")
+      //{
+      //  OS.HeaderOS << "struct __declspec(dllexport) WIPoint2D" << 
+      //    "{\n" <<
+      //    "  int X;\n" <<
+      //    "  int Y;\n" <<
+      //    "};\n\n" <<
+      //    "__declspec(dllexport) WIPoint2D* WIPoint2D_create();\n" <<
+      //    "__declspec(dllexport) void WIPoint2D_destroy(WIPoint2D* val);\n\n";
+
+      //  OS.BodyOS << "WIPoint2D * WIPoint2D_create()\n" <<
+      //    "{\n" <<
+      //    "  return new WIPoint2D();\n"
+      //    "}\n\n" <<
+      //    "void WIPoint2D_destroy(WIPoint2D* val)\n" <<
+      //    "{\n" <<
+      //    "  delete val;\n" <<
+      //    "}\n\n";
 
       DeclarationMatcher classMatcher =
         cxxMethodDecl(isPublic(), ofClass(hasName(className)))
         .bind("publicMethodDecl");
+
+      DeclarationMatcher derivedClassMatcher =
+        cxxRecordDecl(isDerivedFrom(hasName("IFinding")/*anything()*/)).bind("derivedClassDecl");
+
       Matcher.addMatcher(classMatcher, &HandlerForClassMatcher);
+      Matcher.addMatcher(derivedClassMatcher, &HandlerForClassMatcher);
     }
   }
 
@@ -400,45 +448,67 @@ private:
   MatchFinder Matcher;
 };
 
+string guessOriginalClassNameFromFileName(string name)
+{
+  // strip off the tailing hpp
+  auto dotIndex = name.find(".");
+  if (dotIndex != string::npos)
+    name = name.substr(0, dotIndex);
+
+  return name;
+}
+
+
 // For each source file provided to the tool, a new FrontendAction is created.
 class MyFrontendAction : public ASTFrontendAction
 {
 public:
   MyFrontendAction()
   {
-    OS.HeaderOS << "#ifndef _WBREASTGEOMETRY_H_\n"
-      "#define _WBREASTGEOMETRY_H_\n"
-      "#include <stdbool.h>\n"
-      "#include <Windows.h>\n"
-      "#ifdef __cplusplus\n"
-      "extern \"C\"{\n"
-      "#endif\n"
-      "\n"
-      "__declspec(dllexport) BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);\n"
-      "\n";
+    _originalIncludeFileName = currentFile;
 
-    OS.BodyOS << "#include \"WBreastGeometryAlgo.h\"\n"
-      "#include \"BreastGeometryAlgo.h\"\n"
-      "#ifdef __cplusplus\n"
-      "extern \"C\"{\n"
-      "#endif\n"
-      "\n"
-      "BOOL WINAPI DllMain(HINSTANCE/*hinstDLL*/, DWORD fdwReason, LPVOID/*lpvReserved*/)\n"
-      "{\n"
-      "  if (fdwReason == DLL_PROCESS_ATTACH)\n"
-      "  {\n"
-      "  }\n"
-      "  else if (fdwReason == DLL_PROCESS_DETACH) \n"
-      "  {\n"
-      "  }\n"
-      "  return TRUE;\n"
-      "}\n\n";
+    currentFile = guessOriginalClassNameFromFileName(currentFile);
+    // strip off the leading I
+    if (currentFile[0] == 'I')
+      currentFile = currentFile.substr(1, currentFile.size() - 1);
+
+
+    _className = "W" + currentFile;
+    _headerFileName = _className + ".h";
+    _bodyFileName = _className + ".cpp";
   }
+
 
   bool BeginSourceFileAction(CompilerInstance &CI) override
   {
-    _headerFileName = "WBreastGeometryAlgo.h";
-    _bodyFileName = "WBreastGeometryAlgo.cpp";
+    OS.HeaderOS <<
+      "///////////////////////////////////////////////////////////////////\n"
+      "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\n"
+      "///////////////////////////////////////////////////////////////////\n"
+      "#ifndef _" << toUpper(_className) << "_\n"
+      "#define _" << toUpper(_className) << "_\n"
+      "\n"
+      "/* FIXME Includes are missing */\n"
+      "#include \"MacroHelper.h\"\n"
+      "\n"
+      "#ifdef __cplusplus\n"
+      "extern \"C\"{\n"
+      "#endif\n"
+      "\n";
+
+    OS.BodyOS <<
+      "///////////////////////////////////////////////////////////////////\n"
+      "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\n"
+      "///////////////////////////////////////////////////////////////////\n"
+      "\n"
+      "#include \"" << _headerFileName << "\"\n"
+      "\n"
+      "#include <R2MgCadSr/" << _originalIncludeFileName << ">\n"
+      "#include \"TemplateHelper.h\"\n"
+      "\n"
+      "using namespace R2::Citra::Mammo::Decoding;\n"
+      "\n";
+
     return true;
   }
 
@@ -464,14 +534,30 @@ public:
       exit(1);
     }
 
-    OS.HeaderOS << "#ifdef __cplusplus\n"
+    OS.HeaderOS <<
+      "};\n"
+      "\n"
+      "" << 
+      "__declspec(dllexport) " << _className << "* " << _className << "_create(const void* origin);\n"
+      "__declspec(dllexport) void " << _className << "_destroy(" << _className << "* va);\n"
+      "\n"
+      "DECLARE_VECTOR(" << _className << ")\n"
+      "\n"
+      "#ifdef __cplusplus\n"
       "}\n"
       "#endif\n"
-      "#endif /* _WBREASTGEOMETRY_H_ */\n";
+      "\n"
+      "#endif /* _" << toUpper(_className) << "_ */\n";
 
-    OS.BodyOS << "#ifdef __cplusplus\n"
+    OS.BodyOS <<
+      ");\n"
       "}\n"
-      "#endif\n";
+      "\n"
+      "void " << _className << "_destroy(" << _className << "* val)\n" <<
+      "{\n" << 
+      OS.destructorString <<
+      "  delete val;\n"
+      "}\n";
 
     OS.HeaderOS.flush();
     OS.BodyOS.flush();
@@ -487,6 +573,8 @@ public:
 
 private:
   OutputStreams OS;
+  string _originalIncludeFileName;
+  string _className;
   string _headerFileName;
   string _bodyFileName;
 };
@@ -497,6 +585,10 @@ int main(int argc, const char **argv)
   CommonOptionsParser op(argc, argv, CPP2CCategory);
   // create a new Clang Tool instance (a LibTooling environment)
   ClangTool Tool(op.getCompilations(), op.getSourcePathList());
+
+  auto sourcePathList = op.getSourcePathList();
+  currentFile = sourcePathList[0];
+  ClassList.push_back(guessOriginalClassNameFromFileName(sourcePathList[0]));
 
   // run the Clang Tool, creating a new FrontendAction
   return Tool.run(newFrontendActionFactory<MyFrontendAction>().get());
