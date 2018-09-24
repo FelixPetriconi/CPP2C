@@ -96,15 +96,20 @@ OutputFilename("o", cl::desc(Options->getOptionHelpText((options::OPT_o))));
 /** Classes to be mapped to C **/
 struct OutputStreams
 {
+  const string currentSourceFile;
+  string headerFileBeforeIncludes;
+  string headerFileAfterIncludes;
   string headerString;
   string bodyString;
   string destructorString;
+  std::vector<string> includeFiles;
 
   llvm::raw_string_ostream HeaderOS;
   llvm::raw_string_ostream BodyOS;
 
-  OutputStreams()
-    : headerString("")
+  OutputStreams(string currentSourceFile)
+    : currentSourceFile(std::move(currentSourceFile))
+    , headerString("")
     , bodyString("")
     , HeaderOS(headerString)
     , BodyOS(bodyString)
@@ -130,11 +135,22 @@ public:
   struct CType
   {
     string mappedType;
+    string declarationSourceFile;
     bool isPointer = false;
     bool isVector = false;
   };
 
-  CType determineCType(const QualType &qt)
+  string stripPathFromFileName(string fileName) const
+  {
+    auto pos = fileName.find_last_of("\\/");
+    if (pos != string::npos)
+    {
+      fileName = fileName.substr(pos+1, fileName.size() - pos - 1);
+    }
+    return fileName;
+  }
+
+  CType determineCType(const SourceManager& sourceManager, const QualType &qt)
   {
     // How to get full name with namespace 
     // QualType::getAsString(cl->getASTContext().getTypeDeclType(const_cast<CXXRecordDecl*>(cl)).split())
@@ -151,6 +167,7 @@ public:
     else if (qt->isEnumeralType())
     {
       auto enumType = qt->getAs<EnumType>()->getDecl();
+      result.declarationSourceFile = sourceManager.getFilename(enumType->getLocation()).str();
       result.mappedType = "W" + enumType->getNameAsString();
     }
     else if (qt->isRecordType() || (qt->isReferenceType() || qt->isPointerType()) &&
@@ -161,6 +178,7 @@ public:
           ? qt->getPointeeType()->getAsCXXRecordDecl() : qt->getAsCXXRecordDecl();
 
       string recordName = crd->getNameAsString();
+      result.declarationSourceFile = sourceManager.getFilename(crd->getLocation()).str();
       if (recordName == "basic_string")
       {
         result.mappedType = "char";
@@ -177,11 +195,13 @@ public:
         {
           const auto &baseType = asTypePtr->getPointeeType()->getAsCXXRecordDecl();
           valueTypeName = baseType->getName();
+          result.declarationSourceFile = sourceManager.getFilename(baseType->getLocation()).str();
         }
         else
         {
           const auto &baseType = asTypePtr->getAsCXXRecordDecl();
           valueTypeName = baseType->getName();
+          result.declarationSourceFile = sourceManager.getFilename(baseType->getLocation()).str();
         }
 
         result.mappedType = "vector_" + createNewClassName(valueTypeName);
@@ -191,6 +211,7 @@ public:
       else
       {
         result.mappedType = createNewClassName(recordName);
+        result.declarationSourceFile = sourceManager.getFilename(crd->getLocation()).str();
         result.isPointer = true;
       }
     }
@@ -203,6 +224,8 @@ public:
     if (passed)
       return;
 
+    const SourceManager &sourceManager = Result.Context->getSourceManager();
+
     if (const CXXRecordDecl *crd = Result.Nodes.getNodeAs<CXXRecordDecl>("classDecl"))
     {
       std::stringstream functionBody;
@@ -212,8 +235,9 @@ public:
 
       const auto originalClassName = crd->getNameAsString();
       const auto newClassName = createNewClassName(originalClassName);
-
-      OS.HeaderOS <<
+      
+      stringstream headerPart;
+      headerPart <<
         "struct __declspec(dllexport) " << newClassName << "\n"
         "{\n"
         "  static " << newClassName << "*(*constructor)(const void*);\n"
@@ -228,12 +252,12 @@ public:
         const auto originalBaseClassName = baseClass.getType()->getAsCXXRecordDecl()->getNameAsString();
         const auto newBaseClassName = createNewClassName(originalBaseClassName);
 
-        OS.HeaderOS <<
+        headerPart <<
           "  " << newBaseClassName << "* base;\n";
 
         constructorBody <<
           "  const auto originalBase = reinterpret_cast<const " << originalClassName << "*>(origin);\n"
-          "  result->base = " << newBaseClassName << "_create(dynamic_cast<const " << originalBaseClassName << "*>(originalBase))\n";
+          "  result->base = " << newBaseClassName << "_create(dynamic_cast<const " << originalBaseClassName << "*>(originalBase));\n";
 
         destructorBody << "  " << newBaseClassName << "_destroy(val->base);\n";
       }
@@ -246,7 +270,7 @@ public:
         "\n" <<
         newClassName << "* " << newClassName << "_create(const void* origin)\n"
         "{\n"
-        "  auto result WSCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin";
+        "  auto result = WSCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin";
 
       // Loop over public functions
       for (const auto& method : crd->methods())
@@ -284,16 +308,27 @@ public:
           mappedFunctionName[0] = tolower(mappedFunctionName[0]);
 
           const QualType qt = method->getReturnType();
-          auto cType = determineCType(qt);
+          auto cType = determineCType(sourceManager, qt);
+
+          cType.declarationSourceFile = stripPathFromFileName(cType.declarationSourceFile);
+
+          if (!cType.declarationSourceFile.empty() && cType.declarationSourceFile != OS.currentSourceFile)
+          {
+            if (cType.declarationSourceFile[0] == 'I')
+            {
+              cType.declarationSourceFile = cType.declarationSourceFile.substr(1, cType.declarationSourceFile.size() - 1);
+            }
+            appendUnique(OS.includeFiles, "W" + cType.declarationSourceFile);
+          }
 
           if (cType.isPointer)
           {
-            OS.HeaderOS <<
+            headerPart <<
               "  const " << cType.mappedType << "* " << mappedFunctionName << ";\n";
           }
           else
           {
-            OS.HeaderOS <<
+            headerPart <<
               "  " << cType.mappedType << " " << mappedFunctionName << ";\n";
           }
 
@@ -304,26 +339,23 @@ public:
           {
             if (cType.mappedType == "char")
             {
-              destructorBody << "  delete [] " << mappedFunctionName << ";\n";
-            }
-            else if (cType.isVector)
-            {
-              destructorBody << "  " << cType.mappedType << "_destroy(val->" << mappedFunctionName << ");\n";
+              destructorBody << "  delete [] val->" << mappedFunctionName << ";\n";
             }
             else
             {
-              destructorBody << "  delete " << mappedFunctionName << ";\n";
+              destructorBody << "  " << cType.mappedType << "_destroy(val->" << mappedFunctionName << ");\n";
             }
           }
         }
 
         if (method->getNumParams() > 1)
         {
-          OS.HeaderOS << "/* FIXME function with parameter */" << mappedFunctionName << "\n";
+          mappedFunctionName = method->getNameAsString();
+          headerPart << "/* FIXME function with parameter " << mappedFunctionName << " */\n";
         }
       }
 
-      OS.HeaderOS <<
+      headerPart <<
         "};\n"
         "\n"
         "" <<
@@ -331,6 +363,10 @@ public:
         "__declspec(dllexport) void " << newClassName << "_destroy(" << newClassName << "* val);\n"
         "\n"
         "DECLARE_VECTOR(" << newClassName << ")\n";
+
+      headerPart.flush();
+
+      OS.headerFileAfterIncludes += headerPart.str();
 
       OS.BodyOS <<
         ");\n" <<
@@ -406,6 +442,7 @@ class MyFrontendAction : public ASTFrontendAction
 {
 public:
   MyFrontendAction()
+    : OS(currentFile)
   {
     _originalIncludeFileName = currentFile;
 
@@ -423,20 +460,28 @@ public:
 
   bool BeginSourceFileAction(CompilerInstance &CI) override
   {
-    OS.HeaderOS <<
+    stringstream beforeIncludes;
+    beforeIncludes <<
       "///////////////////////////////////////////////////////////////////\n"
       "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\n"
       "///////////////////////////////////////////////////////////////////\n"
       "#ifndef _" << toUpper(_className) << "_\n"
       "#define _" << toUpper(_className) << "_\n"
-      "\n"
-      "/* FIXME Includes are missing */\n"
+      "\n";
+    beforeIncludes.flush();
+
+    OS.headerFileBeforeIncludes = beforeIncludes.str();
+
+    stringstream afterIncludes;
+    afterIncludes <<
       "#include \"MacroHelper.h\"\n"
       "\n"
       "#ifdef __cplusplus\n"
       "extern \"C\"{\n"
       "#endif\n"
       "\n";
+    afterIncludes.flush();
+    OS.headerFileAfterIncludes = afterIncludes.str();
 
     OS.BodyOS <<
       "///////////////////////////////////////////////////////////////////\n"
@@ -477,6 +522,16 @@ public:
     }
 
     OS.HeaderOS <<
+      OS.headerFileBeforeIncludes;
+
+    for (const auto& fileName : OS.includeFiles)
+    {
+      OS.HeaderOS <<
+        "#include \"" << fileName << "\"\n";
+    }
+
+    OS.HeaderOS <<
+      OS.headerFileAfterIncludes <<
       "\n"
       "#ifdef __cplusplus\n"
       "}\n"
@@ -488,7 +543,7 @@ public:
 
     OS.HeaderOS.flush();
     OS.BodyOS.flush();
-    HOS << OS.headerString << "\n";
+    HOS << OS.headerString << "\n";    
     BOS << OS.bodyString << "\n";
   }
 
