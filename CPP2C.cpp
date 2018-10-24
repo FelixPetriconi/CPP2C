@@ -31,6 +31,10 @@ using namespace llvm;
 
 namespace
 {
+  const string ClassPrefix = "W2D";
+  const string R2NameSpace = "R2::Citra::Mammo::Decoding";
+  const string ThirdpartyInclude = "R2MgCadSr";
+
   string toUpper(string strToConvert)
   {
     std::transform(strToConvert.begin(), strToConvert.end(), strToConvert.begin(), ::toupper);
@@ -59,14 +63,7 @@ namespace
     return false;
   }
 
-  /**
-   * Appends element to the specified container if it not already available which is
-   * checked by a predicate
-   * @param c that supports a range specified by the begin() and end() ForwardIterators
-   * @param value that will be append to the container
-   * @param p UnaryPredicate that is used for equality check
-   * @return true if it was appended, otherwise false
-   */
+ 
   template<class Container, typename T, class Predicate>
   bool appendUnique(Container& c, T value, Predicate p)
   {
@@ -77,36 +74,16 @@ namespace
     }
     return false;
   }
-  /*
-
-  template<typename R, typename T, template <typename, typename> class Container, typename Accessor>
-  R join(const Container<T, std::allocator<T>> &values, Accessor accessor, const char *separator = ",")
-  {
-    R result;
-    if (values.size() > 0)
-    {
-      result = accessor(*values.begin());
-      std::for_each(++values.begin(), values.end(), [&result, &separator, &accessor](const T& v)
-      {
-        result += separator;
-        result += accessor(v);
-      });
-    }
-    return result;
-  }
-
-  string join(const vector<string>& values, const char *separator = ",")
-  {
-    return join<string>(values, [](const string& item) {return item; }, separator);
-  }
-  */
-
+  
   string createNewClassName(string oldName)
   {
     if (oldName[0] == 'I')
       oldName = oldName.substr(1);
 
-    return "W" + oldName;
+    if (oldName.find(ClassPrefix) == string::npos)
+      return ClassPrefix + oldName;
+    
+    return oldName;
   }
 
   template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
@@ -125,7 +102,30 @@ namespace
     }
   };
 
+
+  string stripPathFromFileName(string fileName)
+  {
+    auto pos = fileName.find_last_of("\\/");
+    if (pos != string::npos)
+    {
+      fileName = fileName.substr(pos + 1, fileName.size() - pos - 1);
+    }
+    return fileName;
+  }
+
+  string guessOriginalClassNameFromFileName(string name)
+  {
+    // strip off the tailing hpp
+    auto dotIndex = name.find(".");
+    if (dotIndex != string::npos)
+      name = name.substr(0, dotIndex);
+
+    return stripPathFromFileName(name);
+  }
+
+
   string currentFile;
+  string originalSourceFile;
 
   /** Options **/
   cl::OptionCategory CPP2CCategory("CPP2C options");
@@ -245,18 +245,9 @@ public:
     bool isVector = false;
     bool isVoid = false;
     bool isPOD = false;
+    bool isLValueReference = false;
     bool explicitConstructionNecessary = false;
   };
-
-  string stripPathFromFileName(string fileName) const
-  {
-    auto pos = fileName.find_last_of("\\/");
-    if (pos != string::npos)
-    {
-      fileName = fileName.substr(pos+1, fileName.size() - pos - 1);
-    }
-    return fileName;
-  }
 
   template <typename T>
   struct VisitValue
@@ -290,9 +281,25 @@ public:
       }
       else
       {
-        result.mappedType = qt.getAsString();
+        if (qt->isBooleanType())
+        {
+          result.mappedType = "int";
+          result.originalType = "bool";
+        }
+        else
+        {
+          result.mappedType = qt.getAsString();
+          result.originalType = qt.getAsString();
+        }
       }
+
+      result.isPOD = true;
+    }
+    else if (qt->isLValueReferenceType() && qt->getPointeeType()->isBuiltinType())
+    {
+      result.mappedType = qt.getAsString();
       result.originalType = qt.getAsString();
+      result.isLValueReference = true;
       result.isPOD = true;
     }
     else if (qt->isEnumeralType())
@@ -300,27 +307,30 @@ public:
       auto enumType = qt->getAs<EnumType>()->getDecl();
       result.originalType = enumType->getNameAsString();
       result.declarationSourceFile = sourceManager.getFilename(enumType->getLocation()).str();
-      result.mappedType = "W" + enumType->getNameAsString();
+      result.mappedType = ClassPrefix + enumType->getNameAsString();
       result.static_cast_needed = true;
 
-      stringstream enumDefinition;
-      enumDefinition <<
-        "enum " << result.mappedType << "\n"
-        "{ \n";
-
-      std::vector<string> enumerations;
-      std::transform(enumType->enumerator_begin(), enumType->enumerator_end(), back_inserter(enumerations), [](const auto& enumItem)
+      if (stripPathFromFileName(result.declarationSourceFile) == originalSourceFile)
       {
-        return string("  ") + enumItem->getNameAsString() + " = " + to_string(enumItem->getInitVal().getExtValue());
-      });
+        stringstream enumDefinition;
+        enumDefinition <<
+          "enum " << result.mappedType << "\n"
+          "{ \n";
 
-      enumDefinition << 
-        ::join(enumerations, ", \n") << "\n" << 
-        "};\n";
+        std::vector<string> enumerations;
+        std::transform(enumType->enumerator_begin(), enumType->enumerator_end(), back_inserter(enumerations), [](const auto& enumItem)
+        {
+          return string("  ") + enumItem->getNameAsString() + " = " + to_string(enumItem->getInitVal().getExtValue());
+        });
 
-      enumDefinition.flush();
+        enumDefinition <<
+          ::join(enumerations, ", \n") << "\n" <<
+          "};\n";
 
-      result.enumDefinition = enumDefinition.str();
+        enumDefinition.flush();
+
+        result.enumDefinition = enumDefinition.str();
+      }
     }
     else if (qt->isRecordType() || (qt->isReferenceType() || qt->isPointerType()) &&
       qt->getPointeeType()->isRecordType()) // class or struct
@@ -345,24 +355,50 @@ public:
         auto tcrd = dyn_cast<ClassTemplateSpecializationDecl>(crd);
         const auto &templateArgument = tcrd->getTemplateArgs().asArray()[0];
         const auto &asType = templateArgument.getAsType();
-        const auto &asTypePtr = asType.getTypePtr();
-        if (asTypePtr->isPointerType())
+
+        auto cType = determineCType(sourceManager, asType);
+
+        if (cType.originalType == "std::string")
         {
-          const auto &baseType = asTypePtr->getPointeeType()->getAsCXXRecordDecl();
-          valueTypeName = baseType->getName();
-          result.declarationSourceFile = sourceManager.getFilename(baseType->getLocation()).str();
+          valueTypeName = "string";
+          result.declarationSourceFile = "StringHelper.h";
+        }
+        else if (cType.originalType == "Point2D<int>" || cType.originalType == "Point2D<float>")
+        {
+          valueTypeName = cType.mappedType;
+          result.declarationSourceFile = cType.declarationSourceFile;
         }
         else
         {
-          const auto &baseType = asTypePtr->getAsCXXRecordDecl();
-          valueTypeName = baseType->getName();
-          result.declarationSourceFile = sourceManager.getFilename(baseType->getLocation()).str();
+          valueTypeName = cType.mappedType;
+          result.declarationSourceFile = cType.declarationSourceFile;
         }
 
         result.mappedType = "vector_" + createNewClassName(valueTypeName);
         result.isPointer = true;
         result.isVector = true;
         result.explicitConstructionNecessary = true;
+      }
+      else if (recordName == "Point2D")
+      {
+        auto tcrd = dyn_cast<ClassTemplateSpecializationDecl>(crd);
+        const auto &templateArgument = tcrd->getTemplateArgs().asArray()[0];
+        const auto &asType = templateArgument.getAsType();
+        auto valueTypeName = asType.getAsString();;
+
+        if (valueTypeName == "int")
+        {
+          result.mappedType = ClassPrefix + "Point2DInt";
+          result.originalType = "Point2D<int>";
+        }
+        else
+        {
+          result.mappedType = ClassPrefix + "Point2DFloat";
+          result.originalType = "Point2D<float>";
+        }
+        result.declarationSourceFile = "Point2D.h";
+        result.explicitConstructionNecessary = true;
+        result.isPointer = true;
       }
       else
       {
@@ -457,7 +493,7 @@ public:
       constructorBody << 
         newClassName << "* " << newClassName << "_create(const void* origin)\n"
         "{\n"
-        "  auto result = WSCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin);\n";
+        "  auto result = " << ClassPrefix << "SCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin);\n";
 
       destructorBody <<
         "void " << newClassName << "_destroy(const " << newClassName << "* self) \n" <<
@@ -506,7 +542,7 @@ public:
       // Loop over public functions
       for (const auto& method : crd->methods())
       {
-        if (!method->isExternallyVisible())
+        if (method->getAccess() != AccessSpecifier::AS_public)
           continue;
 
         string mappedFunctionName;
@@ -518,8 +554,8 @@ public:
         // constructor
         if (const CXXConstructorDecl *ccd = dyn_cast<CXXConstructorDecl>(method))
         {
-          VisitValue{ OS.headerContent }.append(HeaderItems::FreeFunctionDeclaration,
-            "  FIXME: ADDITIONAL CONSTRUCTOR NEEDED\n");
+          //VisitValue{ OS.headerContent }.append(HeaderItems::FreeFunctionDeclaration,
+          //  "  FIXME: ADDITIONAL CONSTRUCTOR NEEDED\n");
 
           //if (ccd->isCopyConstructor() || ccd->isMoveConstructor())
           //  return;
@@ -552,7 +588,7 @@ public:
 
             if (!sourceFileName.empty())
             {
-              appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"W" + sourceFileName + "\"");
+              appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"" + ClassPrefix + sourceFileName + "\"");
             }
 
             if (!cType.enumDefinition.empty())
@@ -577,7 +613,7 @@ public:
 
           if (!method->isStatic())
           {
-            parameters.push_back(newClassName + "* self");
+            parameters.push_back("const " + newClassName + "* self");
           }
 
           for (const auto& parameter : method->parameters())
@@ -592,7 +628,7 @@ public:
 
               if (!sourceFileName.empty())
               {
-                appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"W" + sourceFileName + "\"");
+                appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"" + ClassPrefix + sourceFileName + "\"");
               }
             }
 
@@ -602,7 +638,10 @@ public:
             }
             else
             {
-              parameters.push_back("const " + pType.mappedType + "& " + parameterName);
+              if (!pType.isLValueReference)
+                parameters.push_back("const " + pType.mappedType + "& " + parameterName);
+              else
+                parameters.push_back(pType.mappedType + " " + parameterName);
             }
             parametersCall.push_back(parameterName);
           }
@@ -650,7 +689,8 @@ public:
             {
               functionBody <<
                 "  using OriginType = decltype(value);\n" <<
-                "  return WSCR::createWrappedObjectArray<OriginType, " << cType.mappedType << ">(value);\n";
+                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\n " <<
+                "  return " << ClassPrefix << "SCR::createWrappedObjectArray<PureType, " << cType.mappedType << ">(value);\n";
             }
             else if (cType.isPOD)
             {
@@ -660,7 +700,8 @@ public:
             {
               functionBody <<
                 "  using OriginType = decltype(value);\n" <<
-                "  return WSCR::createWrappedObject<OriginType, " << cType.mappedType << ">(&value);\n";
+                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\n " <<
+                "  return " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\n";
             }
           }
           functionBody <<
@@ -672,28 +713,6 @@ public:
           parametersCall.clear();
           functionHeader.str(string());
           functionBody.str(string());
-
-          //  OS.BodyOS << ",\n"
-          //    "    &" << originalClassName << "::" << method->getNameAsString() << ", &" << newClassName << "::" << mappedFunctionName;
-
-          //  if (cType.isPointer)
-          //  {
-          //    if (cType.mappedType == "char")
-          //    {
-          //      destructorBody << "  delete [] val->" << mappedFunctionName << ";\n";
-          //    }
-          //    else
-          //    {
-          //      destructorBody << "  " << cType.mappedType << "_destroy(val->" << mappedFunctionName << ");\n";
-          //    }
-          //  }
-          //}
-          //else // is void
-          //{
-          //  declarationNeedsSelf = true;
-          //  freeFunctionsDeclarationPart <<
-          //    "void " << newClassName << "_" << originalFunctionName << "(" << newClassName << "* self)\n";
-          //}
         }
       }
 
@@ -754,15 +773,6 @@ private:
   MatchFinder Matcher;
 };
 
-string guessOriginalClassNameFromFileName(string name)
-{
-  // strip off the tailing hpp
-  auto dotIndex = name.find(".");
-  if (dotIndex != string::npos)
-    name = name.substr(0, dotIndex);
-
-  return name;
-}
 
 
 // For each source file provided to the tool, a new FrontendAction is created.
@@ -774,13 +784,15 @@ public:
   {
     _originalIncludeFileName = currentFile;
 
+    originalSourceFile = stripPathFromFileName(currentFile);
+
     currentFile = guessOriginalClassNameFromFileName(currentFile);
     // strip off the leading I
     if (currentFile[0] == 'I')
       currentFile = currentFile.substr(1, currentFile.size() - 1);
 
 
-    _className = "W" + currentFile;
+    _className = ClassPrefix + currentFile;
     _headerFileName = _className + ".h";
     _bodyFileName = _className + ".cpp";
   }
@@ -828,10 +840,10 @@ public:
       "\n";
 
     OS.bodyContent[BodyItems::AdditionalIncludeFiles] =
-      vector<string>{ "#include <R2MgCadSr/" + _originalIncludeFileName + ">\n" };
+      vector<string>{ "#include <"+ ThirdpartyInclude +"/" + stripPathFromFileName(_originalIncludeFileName) + ">\n" };
 
     OS.bodyContent[BodyItems::Usings] =
-      vector<string>{ "using namespace R2::Citra::Mammo::Decoding;\n" };
+      vector<string>{ "using namespace " + R2NameSpace + ";\n" };
 
     return true;
   }
