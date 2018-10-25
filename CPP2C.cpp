@@ -15,11 +15,13 @@
 
 #include "clang/Driver/Options.h"
 #include <algorithm>
+
 #include <map>
 #include <variant>
 #include <sstream>
 #include <vector>
 #include <locale>
+#include <numeric>
 
 
 using namespace std;
@@ -121,6 +123,18 @@ namespace
       name = name.substr(0, dotIndex);
 
     return stripPathFromFileName(name);
+  }
+
+  string allUpperLetters(const string& camelCase)
+  {
+    return std::accumulate(camelCase.begin(), camelCase.end(), string(), 
+      [](string val, char c)
+    {
+      if (isUppercase(c))
+        return val + c;
+      return val;
+    });
+
   }
 
 
@@ -243,9 +257,12 @@ public:
     bool static_cast_needed = false;
     bool isPointer = false;
     bool isVector = false;
+    bool isEnum = false;
     bool isVoid = false;
     bool isPOD = false;
+    bool isReference = false;
     bool isLValueReference = false;
+    bool isConstant = false;
     bool explicitConstructionNecessary = false;
   };
 
@@ -272,6 +289,9 @@ public:
     // QualType::getAsString(cl->getASTContext().getTypeDeclType(const_cast<CXXRecordDecl*>(cl)).split())
     CType result;
     // if it is build-in type use it as is
+    result.isReference = qt->isReferenceType();
+    result.isConstant = qt.isConstQualified();
+
     if (qt->isBuiltinType() ||
         (qt->isPointerType() && qt->getPointeeType()->isBuiltinType()))
     {
@@ -285,6 +305,7 @@ public:
         {
           result.mappedType = "int";
           result.originalType = "bool";
+          result.static_cast_needed = true;
         }
         else
         {
@@ -309,6 +330,7 @@ public:
       result.declarationSourceFile = sourceManager.getFilename(enumType->getLocation()).str();
       result.mappedType = ClassPrefix + enumType->getNameAsString();
       result.static_cast_needed = true;
+      result.isEnum = true;
 
       if (stripPathFromFileName(result.declarationSourceFile) == originalSourceFile)
       {
@@ -316,11 +338,11 @@ public:
         enumDefinition <<
           "enum " << result.mappedType << "\n"
           "{ \n";
-
+        const auto uniqueId = allUpperLetters(result.originalType);
         std::vector<string> enumerations;
-        std::transform(enumType->enumerator_begin(), enumType->enumerator_end(), back_inserter(enumerations), [](const auto& enumItem)
+        std::transform(enumType->enumerator_begin(), enumType->enumerator_end(), back_inserter(enumerations), [uniqueId](const auto& enumItem)
         {
-          return string("  ") + enumItem->getNameAsString() + " = " + to_string(enumItem->getInitVal().getExtValue());
+          return string("  ") + uniqueId + "_" + enumItem->getNameAsString() + " = " + to_string(enumItem->getInitVal().getExtValue());
         });
 
         enumDefinition <<
@@ -362,16 +384,20 @@ public:
         {
           valueTypeName = "string";
           result.declarationSourceFile = "StringHelper.h";
+          result.originalType = "std::vector<std::string>";
         }
         else if (cType.originalType == "Point2D<int>" || cType.originalType == "Point2D<float>")
         {
           valueTypeName = cType.mappedType;
           result.declarationSourceFile = cType.declarationSourceFile;
+          result.originalType = "std::vector<" + cType.originalType + ">";
         }
         else
         {
           valueTypeName = cType.mappedType;
           result.declarationSourceFile = cType.declarationSourceFile;
+          auto valueType = (cType.isPointer ? "const " : "") + cType.originalType + (cType.isPointer ? "*" : "");
+          result.originalType = "std::vector<" + valueType + ">";
         }
 
         result.mappedType = "vector_" + createNewClassName(valueTypeName);
@@ -402,6 +428,7 @@ public:
       }
       else
       {
+        result.originalType = recordName;
         result.mappedType = createNewClassName(recordName);
         result.declarationSourceFile = sourceManager.getFilename(crd->getLocation()).str();
         result.isPointer = true;
@@ -540,6 +567,7 @@ public:
 
       // TODO Loop over members
       // Loop over public functions
+      std::unordered_map<string, int> functionList;
       for (const auto& method : crd->methods())
       {
         if (method->getAccess() != AccessSpecifier::AS_public)
@@ -579,6 +607,17 @@ public:
           mappedFunctionName[0] = tolower(mappedFunctionName[0]);
           mappedFunctionName = newClassName + "_" + mappedFunctionName;
 
+          auto itFind = functionList.find(mappedFunctionName);
+          if (itFind == functionList.end())
+          {
+            functionList.insert({ mappedFunctionName, 0 });
+          }
+          else
+          {
+            ++(itFind->second);
+            mappedFunctionName += std::to_string(itFind->second);
+          }
+
           const QualType qt = method->getReturnType();
           auto cType = determineCType(sourceManager, qt);
 
@@ -611,39 +650,70 @@ public:
             functionBody << returnType << " " << mappedFunctionName << "(";
           }
 
+          auto constness = method->isConst() ? "const " : "";
           if (!method->isStatic())
           {
-            parameters.push_back("const " + newClassName + "* self");
+            parameters.push_back(constness + newClassName + "* self");
           }
 
+          stringstream additionalVariables;
+          stringstream returnByReference;
+          int variableIndex = 0;
           for (const auto& parameter : method->parameters())
           {
             const QualType paramQt = parameter->getOriginalType();
             auto pType = determineCType(sourceManager, paramQt);
             const auto& parameterName = parameter->getNameAsString();
 
-            if (!pType.isVoid)
+            auto sourceFileName = generateMappedInclude(pType.declarationSourceFile);
+            if (!sourceFileName.empty())
             {
-              auto sourceFileName = generateMappedInclude(cType.declarationSourceFile);
-
-              if (!sourceFileName.empty())
-              {
-                appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"" + ClassPrefix + sourceFileName + "\"");
-              }
+              appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"" + ClassPrefix + sourceFileName + "\"");
             }
 
-            if (pType.isPointer)
+
+            if (pType.isReference && !pType.isConstant && !pType.isPOD && pType.mappedType != "char")
+            {
+              parameters.push_back(pType.mappedType + "* " + parameterName);
+              auto tempVariableName = " val" + to_string(variableIndex);
+              parametersCall.push_back(tempVariableName);
+              additionalVariables << 
+                "  " << pType.originalType << tempVariableName << ";\n";
+              returnByReference <<
+                "  " << ClassPrefix << "SCR::copyArrayObjects(" << tempVariableName << ", " << parameterName << ");\n";
+            }
+            else if (pType.isReference && pType.isConstant)
+            {
+              parameters.push_back("const " + pType.mappedType + "& " + parameterName);
+            }
+            else if (pType.mappedType == "char" || (pType.isPointer && !pType.isReference && pType.isConstant))
             {
               parameters.push_back("const " + pType.mappedType + "* " + parameterName);
+              parametersCall.push_back(parameterName);
             }
-            else
+            else 
             {
-              if (!pType.isLValueReference)
-                parameters.push_back("const " + pType.mappedType + "& " + parameterName);
+              auto type = pType.mappedType;
+              if (type.back() != '&' && pType.isReference)
+              {
+                type += "&";
+              }
+              if (type.find("const") == string::npos && pType.isConstant)
+              {
+                type = "const " + type;
+              }
+              parameters.push_back(type + " " + parameterName);
+              if (pType.static_cast_needed)
+              {
+                parametersCall.push_back("static_cast<" + pType.originalType + ">(" + parameterName + ")");
+              }
               else
-                parameters.push_back(pType.mappedType + " " + parameterName);
+              {
+                parametersCall.push_back(parameterName);
+              }
             }
-            parametersCall.push_back(parameterName);
+            
+            ++variableIndex;
           }
 
           auto allParameters = ::join(parameters, ", ");
@@ -656,20 +726,32 @@ public:
           functionBody << allParameters << ")\n"
             << "{\n";
 
+          additionalVariables.flush();
+          functionBody << additionalVariables.str();
+
           if (!cType.isVoid)
           {
-            functionBody << "  const auto& value = ";
+            functionBody << "  " << ((cType.isPOD || cType.isEnum) ? string() : constness) <<
+              ((cType.isPointer || cType.isPOD || cType.isEnum)? "auto " : "auto& ") << "value = ";
           }
 
           if (method->isStatic())
           {
             functionBody <<
-              originalFunctionName << "(";
+              "  " << originalClassName << "::" << originalFunctionName << "(";
           }
           else
           {
-            functionBody <<
-              "  reinterpret_cast<const " << originalClassName << "*>(self->origin)->" << originalFunctionName << "(";
+            if (method->isConst())
+            {
+              functionBody <<
+                "  reinterpret_cast<const " << originalClassName << "*>(self->origin)->" << originalFunctionName << "(";
+            }
+            else
+            {
+              functionBody <<
+                "  reinterpret_cast<" << originalClassName << "*>(const_cast<void*>(self->origin))->" << originalFunctionName << "(";
+            }
           }
 
           functionBody <<
@@ -704,6 +786,13 @@ public:
                 "  return " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\n";
             }
           }
+          else // isVoid
+          {
+            returnByReference.flush();
+            functionBody <<
+              returnByReference.str();
+          }
+
           functionBody <<
             "}\n";
           
@@ -713,6 +802,8 @@ public:
           parametersCall.clear();
           functionHeader.str(string());
           functionBody.str(string());
+          additionalVariables.str(string());
+          returnByReference.str(string());
         }
       }
 
@@ -830,6 +921,8 @@ public:
       "///////////////////////////////////////////////////////////////////\n"
       "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\n"
       "///////////////////////////////////////////////////////////////////\n"
+      "\n"
+      "#pragma warning(disable:4800)\n"
       "\n";
 
     OS.bodyContent[BodyItems::StandardInclude] =
