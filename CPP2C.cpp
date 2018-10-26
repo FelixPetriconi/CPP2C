@@ -33,7 +33,7 @@ using namespace llvm;
 
 namespace
 {
-  const string ClassPrefix = "W2D";
+  const string ClassPrefix = "R2M_";
   const string R2NameSpace = "R2::Citra::Mammo::Decoding";
   const string ThirdpartyInclude = "R2MgCadSr";
 
@@ -96,11 +96,11 @@ namespace
     llvm::raw_string_ostream& _stream;
     ContentPrinter(llvm::raw_string_ostream& stream) : _stream(stream) {}
 
-    void operator()(const string& s) { _stream << s << "\n"; }
+    void operator()(const string& s) { _stream << s << "\r\n"; }
     void operator()(const vector<string>& v) 
     {
       for (const auto& s : v)
-        _stream << s << "\n";
+        _stream << s << "\r\n";
     }
   };
 
@@ -336,8 +336,8 @@ public:
       {
         stringstream enumDefinition;
         enumDefinition <<
-          "enum " << result.mappedType << "\n"
-          "{ \n";
+          "enum " << result.mappedType << "\r\n"
+          "{ \r\n";
         const auto uniqueId = allUpperLetters(result.originalType);
         std::vector<string> enumerations;
         std::transform(enumType->enumerator_begin(), enumType->enumerator_end(), back_inserter(enumerations), [uniqueId](const auto& enumItem)
@@ -346,8 +346,8 @@ public:
         });
 
         enumDefinition <<
-          ::join(enumerations, ", \n") << "\n" <<
-          "};\n";
+          ::join(enumerations, ", \r\n") << "\r\n" <<
+          "};\r\n";
 
         enumDefinition.flush();
 
@@ -483,48 +483,48 @@ public:
       stringstream declarationPart;
 
       VisitValue{OS.headerContent}.append(HeaderItems::StructBodyTop,
-        "struct __declspec(dllexport) " + newClassName + "\n"
-        "{\n");
+        "struct __declspec(dllexport) " + newClassName + "\r\n"
+        "{\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::StructBodyBottom,
-        "};\n");
+        "};\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-        "  static " + newClassName + "*(*constructor)(const void*);\n");
+        "  static const " + newClassName + "*(*constructor)(const void*);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-        "  static void(*destructor)(" + newClassName + "*);\n");
+        "  static void(*destructor)(const " + newClassName + "*);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-        "  const void* origin;\n");
+        "  const void* origin;\r\n");
 
 
       VisitValue{ OS.headerContent }.append(HeaderItems::ConstructorDeclaration,
-        "__declspec(dllexport) " + newClassName + "* " + newClassName + "_create(const void* origin);\n");
+        "__declspec(dllexport) const " + newClassName + "* " + newClassName + "_create(const void* origin);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::DestructorDeclaration,
-        "__declspec(dllexport) void " + newClassName + "_destroy(" + newClassName + "* val);\n");
+        "__declspec(dllexport) void " + newClassName + "_destroy(const " + newClassName + "* val);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::AdditionalDeclarations,
-        "DECLARE_VECTOR(" + newClassName + ")\n");
+        "DECLARE_VECTOR(" + newClassName + ")\r\n");
 
       VisitValue{ OS.bodyContent }.append(BodyItems::ConstructorDefinition,
-        newClassName + "*(*" + newClassName + "::constructor)(const void*) = &" + newClassName + "_create;\n");
+        "const " + newClassName + "*(*" + newClassName + "::constructor)(const void*) = &" + newClassName + "_create;\r\n");
 
       VisitValue{ OS.bodyContent }.append(BodyItems::DestructorDefinition,
-        "void(*" + newClassName + "::destructor)(" + newClassName + "*) = &" + newClassName + "_destroy;\n");
+        "void(*" + newClassName + "::destructor)(const " + newClassName + "*) = &" + newClassName + "_destroy;\r\n");
 
       VisitValue{ OS.bodyContent }.append(BodyItems::AdditionalImplementations,
-        "DEFINE_VECTOR(" + newClassName + ")\n");
+        "DEFINE_VECTOR(" + newClassName + ")\r\n");
 
       constructorBody << 
-        newClassName << "* " << newClassName << "_create(const void* origin)\n"
-        "{\n"
-        "  auto result = " << ClassPrefix << "SCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin);\n";
+        "const " << newClassName << "* " << newClassName << "_create(const void* origin)\r\n"
+        "{\r\n"
+        "  auto result = " << ClassPrefix << "SCR::createWrappedObject<" << originalClassName << ", " << newClassName << ">(origin);\r\n";
 
       destructorBody <<
-        "void " << newClassName << "_destroy(const " << newClassName << "* self) \n" <<
-        "{\n";
+        "void " << newClassName << "_destroy(const " << newClassName << "* self) \r\n" <<
+        "{\r\n";
 
       // Does this class has a base class? (Multiple base classes are currently not supported
       if (crd->getNumBases() != 0)
@@ -536,14 +536,14 @@ public:
         const auto newBaseClassName = createNewClassName(originalBaseClassName);
 
         VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-          "  " + newBaseClassName + "* base;\n");
+          "  " + newBaseClassName + "* base;\r\n");
 
         constructorBody << 
-          "  const auto originalBase = reinterpret_cast<const " << originalClassName << "*>(origin);\n" <<
-          "  result->base = " << newBaseClassName << "_create(dynamic_cast<const " << originalBaseClassName << "*>(originalBase));\n";
+          "  const auto originalBase = reinterpret_cast<const " << originalClassName << "*>(origin);\r\n" <<
+          "  result->base = " << newBaseClassName << "_create(dynamic_cast<const " << originalBaseClassName << "*>(originalBase));\r\n";
 
         destructorBody << 
-          "  " + newBaseClassName + "_destroy(self->base);\n";
+          "  " + newBaseClassName + "_destroy(self->base);\r\n";
 
         VisitValue{ OS.headerContent }.append(HeaderItems::AdditionalIncludeFiles, "#include \"" + newBaseClassName + ".h\"");
 
@@ -551,16 +551,16 @@ public:
       }
 
       constructorBody <<
-        "  result->origin = origin;\n"
-        "  return result;\n"
-        "};\n";
+        "  result->origin = origin;\r\n"
+        "  return result;\r\n"
+        "};\r\n";
 
       constructorBody.flush();
       VisitValue{ OS.bodyContent }.append(BodyItems::ConstructorImplementation, constructorBody.str());
 
       destructorBody <<
-        "  delete self;\n" << 
-        "}\n";
+        "  delete self;\r\n" << 
+        "}\r\n";
 
       destructorBody.flush();
       VisitValue{ OS.bodyContent }.append(BodyItems::DestructorImplementation, destructorBody.str());
@@ -583,7 +583,7 @@ public:
         if (const CXXConstructorDecl *ccd = dyn_cast<CXXConstructorDecl>(method))
         {
           //VisitValue{ OS.headerContent }.append(HeaderItems::FreeFunctionDeclaration,
-          //  "  FIXME: ADDITIONAL CONSTRUCTOR NEEDED\n");
+          //  "  FIXME: ADDITIONAL CONSTRUCTOR NEEDED\r\n");
 
           //if (ccd->isCopyConstructor() || ccd->isMoveConstructor())
           //  return;
@@ -678,9 +678,9 @@ public:
               auto tempVariableName = " val" + to_string(variableIndex);
               parametersCall.push_back(tempVariableName);
               additionalVariables << 
-                "  " << pType.originalType << tempVariableName << ";\n";
+                "  " << pType.originalType << tempVariableName << ";\r\n";
               returnByReference <<
-                "  " << ClassPrefix << "SCR::copyArrayObjects(" << tempVariableName << ", " << parameterName << ");\n";
+                "  " << ClassPrefix << "SCR::copyArrayObjects(" << tempVariableName << ", " << parameterName << ");\r\n";
             }
             else if (pType.isReference && pType.isConstant)
             {
@@ -717,14 +717,14 @@ public:
           }
 
           auto allParameters = ::join(parameters, ", ");
-          functionHeader << allParameters << ");\n";
+          functionHeader << allParameters << ");\r\n";
           functionHeader.flush();
           VisitValue{ OS.headerContent }.append(HeaderItems::FreeFunctionDeclaration, functionHeader.str());
 
           stringstream functionCall;
 
-          functionBody << allParameters << ")\n"
-            << "{\n";
+          functionBody << allParameters << ")\r\n"
+            << "{\r\n";
 
           additionalVariables.flush();
           functionBody << additionalVariables.str();
@@ -755,35 +755,46 @@ public:
           }
 
           functionBody <<
-            ::join(parametersCall, ", ") << ");\n"; 
+            ::join(parametersCall, ", ") << ");\r\n"; 
 
           if (returnType != "void")
           {
             if (cType.static_cast_needed)
             {
-              functionBody << "  return static_cast<" << cType.mappedType << ">(value);\n";
+              functionBody << "  return static_cast<" << cType.mappedType << ">(value);\r\n";
             }
             else if (cType.mappedType == "char")
             {
-              functionBody << "  return value.c_str();\n";
+              appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"" + ClassPrefix + "StringHelper.h" + "\"");
+              functionBody << "  return " << ClassPrefix << "allocateAndCopyString(value.c_str());\r\n";
             }
             else if (cType.isVector)
             {
               functionBody <<
-                "  using OriginType = decltype(value);\n" <<
-                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\n " <<
-                "  return " << ClassPrefix << "SCR::createWrappedObjectArray<PureType, " << cType.mappedType << ">(value);\n";
+                "  using OriginType = decltype(value);\r\n" <<
+                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\r\n " <<
+                "  return " << ClassPrefix << "SCR::createWrappedObjectArray<PureType, " << cType.mappedType << ">(value);\r\n";
             }
             else if (cType.isPOD)
             {
-              functionBody << "  return value;\n";
+              functionBody << "  return value;\r\n";
             }
             else
             {
               functionBody <<
-                "  using OriginType = decltype(value);\n" <<
-                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\n " <<
-                "  return " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\n";
+                "  using OriginType = decltype(value);\r\n" <<
+                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\r\n ";
+
+              if (cType.isReference)
+              {
+                functionBody <<
+                  "  return " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\r\n";
+              }
+              else
+              {
+                functionBody <<
+                  "  return (value != nullptr)? " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value) : nullptr;\r\n";
+              }
             }
           }
           else // isVoid
@@ -794,7 +805,7 @@ public:
           }
 
           functionBody <<
-            "}\n";
+            "}\r\n";
           
           VisitValue{ OS.bodyContent }.append(BodyItems::FreeFunctionImplementation, functionBody.str());
 
@@ -892,51 +903,51 @@ public:
   bool BeginSourceFileAction(CompilerInstance &CI) override
   {
     OS.headerContent[HeaderItems::CopyrightNotice] =
-      "///////////////////////////////////////////////////////////////////\n"
-      "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\n"
-      "///////////////////////////////////////////////////////////////////\n";
+      "///////////////////////////////////////////////////////////////////\r\n"
+      "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\r\n"
+      "///////////////////////////////////////////////////////////////////\r\n";
 
     OS.headerContent[HeaderItems::IncludeGuardTop] =
-      "#ifndef _" + toUpper(_className) + "_\n"
-      "#define _" + toUpper(_className) + "_\n"
-      "\n";
+      "#ifndef _" + toUpper(_className) + "_\r\n"
+      "#define _" + toUpper(_className) + "_\r\n"
+      "\r\n";
 
     OS.headerContent[HeaderItems::CommonIncludeFiles] = 
-      "#include \"MacroHelper.h\"\n"
-      "\n"
-      "#ifdef __cplusplus\n"
-      "extern \"C\"{\n"
-      "#endif\n"
-      "\n";
+      "#include \"" + ClassPrefix + "MacroHelper.h\"\r\n"
+      "\r\n"
+      "#ifdef __cplusplus\r\n"
+      "extern \"C\"{\r\n"
+      "#endif\r\n"
+      "\r\n";
 
     OS.headerContent[HeaderItems::IncludeGuardBottom] =
-      "\n"
-      "#ifdef __cplusplus\n"
-      "}\n"
-      "#endif\n"
-      "\n"
-      "#endif /* _" + toUpper(_className) + "_ */\n";
+      "\r\n"
+      "#ifdef __cplusplus\r\n"
+      "}\r\n"
+      "#endif\r\n"
+      "\r\n"
+      "#endif /* _" + toUpper(_className) + "_ */\r\n";
 
     OS.bodyContent[BodyItems::CopyrightNotice] =
-      "///////////////////////////////////////////////////////////////////\n"
-      "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\n"
-      "///////////////////////////////////////////////////////////////////\n"
-      "\n"
-      "#pragma warning(disable:4800)\n"
-      "\n";
+      "///////////////////////////////////////////////////////////////////\r\n"
+      "// Copyright 2018 MeVis Medical Solutions AG  all rights reserved\r\n"
+      "///////////////////////////////////////////////////////////////////\r\n"
+      "\r\n"
+      "#pragma warning(disable:4800)\r\n"
+      "\r\n";
 
     OS.bodyContent[BodyItems::StandardInclude] =
-      "#include \"" + _headerFileName + "\"\n";
+      "#include \"" + _headerFileName + "\"\r\n";
 
     OS.bodyContent[BodyItems::CommonIncludeFiles] =
-      "#include \"TemplateHelper.h\"\n"
-      "\n";
+      "#include \"" + ClassPrefix + "TemplateHelper.h\"\r\n"
+      "\r\n";
 
     OS.bodyContent[BodyItems::AdditionalIncludeFiles] =
-      vector<string>{ "#include <"+ ThirdpartyInclude +"/" + stripPathFromFileName(_originalIncludeFileName) + ">\n" };
+      vector<string>{ "#include <"+ ThirdpartyInclude +"/" + stripPathFromFileName(_originalIncludeFileName) + ">\r\n" };
 
     OS.bodyContent[BodyItems::Usings] =
-      vector<string>{ "using namespace " + R2NameSpace + ";\n" };
+      vector<string>{ "using namespace " + R2NameSpace + ";\r\n" };
 
     return true;
   }
@@ -952,21 +963,21 @@ public:
     if (EC)
     {
       llvm::errs() << "while opening '" << headerFile << "': " << EC.message()
-        << '\n';
+        << '\r\n';
       exit(1);
     }
     llvm::raw_fd_ostream BOS(bodyFile, EC, llvm::sys::fs::F_None);
     if (EC)
     {
       llvm::errs() << "while opening '" << bodyFile << "': " << EC.message()
-        << '\n';
+        << '\r\n';
       exit(1);
     }
 
     OS.HeaderOS.flush();
     OS.BodyOS.flush();
-    HOS << OS.headerString << "\n";    
-    BOS << OS.bodyString << "\n";
+    HOS << OS.headerString << "\r\n";    
+    BOS << OS.bodyString << "\r\n";
   }
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
