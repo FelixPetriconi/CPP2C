@@ -536,7 +536,7 @@ public:
         const auto newBaseClassName = createNewClassName(originalBaseClassName);
 
         VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-          "  " + newBaseClassName + "* base;\r\n");
+          "  const " + newBaseClassName + "* base;\r\n");
 
         constructorBody << 
           "  const auto originalBase = reinterpret_cast<const " << originalClassName << "*>(origin);\r\n" <<
