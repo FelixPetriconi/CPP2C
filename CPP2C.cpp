@@ -170,14 +170,16 @@ namespace
     AdditionalIncludeFiles,
     CommonIncludeFiles,
     Usings,
+    ExternCBegin,
     ConstructorDefinition,
-    DestructorDefinition,
+    //DestructorDefinition,
     MembersToCreate,
     MembersToDestruct,
     ConstructorImplementation,
     DestructorImplementation,
     FreeFunctionImplementation,
-    AdditionalImplementations
+    AdditionalImplementations,
+    ExternCEnd
   };
 
 }
@@ -222,14 +224,16 @@ struct OutputStreams
     bodyContent[BodyItems::AdditionalIncludeFiles] = vector<string>{};
     bodyContent[BodyItems::CommonIncludeFiles] = vector<string>{};
     bodyContent[BodyItems::Usings] = vector<string>{};
+    bodyContent[BodyItems::ExternCBegin] = string{};
     bodyContent[BodyItems::ConstructorDefinition] = string{};
-    bodyContent[BodyItems::DestructorDefinition] = string{};
+    //bodyContent[BodyItems::DestructorDefinition] = string{};
     bodyContent[BodyItems::MembersToCreate] = vector<string>{};
     bodyContent[BodyItems::MembersToDestruct] = vector<string>{};
     bodyContent[BodyItems::ConstructorImplementation] = string{};
     bodyContent[BodyItems::DestructorImplementation] = string{};
     bodyContent[BodyItems::FreeFunctionImplementation] = vector<string>{};
     bodyContent[BodyItems::AdditionalImplementations] = vector<string>{};
+    bodyContent[BodyItems::ExternCEnd] = string{};
   }
 };
 
@@ -255,7 +259,8 @@ public:
     string declarationSourceFile;
     string enumDefinition;
     bool static_cast_needed = false;
-    bool isPointer = false;
+    bool isResultPointer = false;
+    bool isOriginalPointer = false;
     bool isVector = false;
     bool isEnum = false;
     bool isVoid = false;
@@ -313,7 +318,7 @@ public:
           result.originalType = qt.getAsString();
         }
       }
-
+      result.isOriginalPointer = qt->isPointerType();
       result.isPOD = true;
     }
     else if (qt->isLValueReferenceType() && qt->getPointeeType()->isBuiltinType())
@@ -338,7 +343,7 @@ public:
         enumDefinition <<
           "enum " << result.mappedType << "\r\n"
           "{ \r\n";
-        const auto uniqueId = allUpperLetters(result.originalType);
+        const auto uniqueId = ClassPrefix + allUpperLetters(result.originalType);
         std::vector<string> enumerations;
         std::transform(enumType->enumerator_begin(), enumType->enumerator_end(), back_inserter(enumerations), [uniqueId](const auto& enumItem)
         {
@@ -363,10 +368,12 @@ public:
 
       string recordName = crd->getNameAsString();
       result.declarationSourceFile = sourceManager.getFilename(crd->getLocation()).str();
+      result.isOriginalPointer = qt->isPointerType();
+
       if (recordName == "basic_string")
       {
         result.mappedType = "char";
-        result.isPointer = true;
+        result.isResultPointer = true;
         result.originalType = "std::string";
         result.explicitConstructionNecessary = true;
         result.declarationSourceFile.clear();
@@ -396,12 +403,12 @@ public:
         {
           valueTypeName = cType.mappedType;
           result.declarationSourceFile = cType.declarationSourceFile;
-          auto valueType = (cType.isPointer ? "const " : "") + cType.originalType + (cType.isPointer ? "*" : "");
+          auto valueType = (cType.isResultPointer ? "const " : "") + cType.originalType + (cType.isResultPointer ? "*" : "");
           result.originalType = "std::vector<" + valueType + ">";
         }
 
         result.mappedType = "vector_" + createNewClassName(valueTypeName);
-        result.isPointer = true;
+        result.isResultPointer = true;
         result.isVector = true;
         result.explicitConstructionNecessary = true;
       }
@@ -424,14 +431,15 @@ public:
         }
         result.declarationSourceFile = "Point2D.h";
         result.explicitConstructionNecessary = true;
-        result.isPointer = true;
+        result.isResultPointer = true;
       }
       else
       {
         result.originalType = recordName;
         result.mappedType = createNewClassName(recordName);
         result.declarationSourceFile = sourceManager.getFilename(crd->getLocation()).str();
-        result.isPointer = true;
+        result.isResultPointer = true;
+        result.isOriginalPointer = qt->isPointerType();
       }
     }
     return result;
@@ -483,36 +491,42 @@ public:
       stringstream declarationPart;
 
       VisitValue{OS.headerContent}.append(HeaderItems::StructBodyTop,
-        "struct __declspec(dllexport) " + newClassName + "\r\n"
+        "struct " + ClassPrefix + "DECLSPEC " + newClassName + "\r\n"
         "{\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::StructBodyBottom,
         "};\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-        "  static const " + newClassName + "*(*constructor)(const void*);\r\n");
+        "  typedef const " + newClassName + "*(*constructor_t)(const void*);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::Members,
-        "  static void(*destructor)(const " + newClassName + "*);\r\n");
+        "  static constructor_t constructor;\r\n");
+
+      VisitValue{ OS.headerContent }.append(HeaderItems::Members,
+        "  typedef void(*destructor_t)(const " + newClassName + "*);\r\n");
+
+      VisitValue{ OS.headerContent }.append(HeaderItems::Members,
+        "  destructor_t destructor;\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::Members,
         "  const void* origin;\r\n");
 
 
       VisitValue{ OS.headerContent }.append(HeaderItems::ConstructorDeclaration,
-        "__declspec(dllexport) const " + newClassName + "* " + newClassName + "_create(const void* origin);\r\n");
+        ClassPrefix + "DECLSPEC const " + newClassName + "* " + newClassName + "_create(const void* origin);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::DestructorDeclaration,
-        "__declspec(dllexport) void " + newClassName + "_destroy(const " + newClassName + "* val);\r\n");
+        ClassPrefix + "DECLSPEC void " + newClassName + "_destroy(const " + newClassName + "* val);\r\n");
 
       VisitValue{ OS.headerContent }.append(HeaderItems::AdditionalDeclarations,
         "DECLARE_VECTOR(" + newClassName + ")\r\n");
 
       VisitValue{ OS.bodyContent }.append(BodyItems::ConstructorDefinition,
-        "const " + newClassName + "*(*" + newClassName + "::constructor)(const void*) = &" + newClassName + "_create;\r\n");
+        newClassName + "::constructor_t " + newClassName + "::constructor = &" + newClassName + "_create;\r\n");
 
-      VisitValue{ OS.bodyContent }.append(BodyItems::DestructorDefinition,
-        "void(*" + newClassName + "::destructor)(const " + newClassName + "*) = &" + newClassName + "_destroy;\r\n");
+      //VisitValue{ OS.bodyContent }.append(BodyItems::DestructorDefinition,
+      //  "void ((*" + newClassName + "::destructor))(const " + newClassName + "*) = &" + newClassName + "_destroy;\r\n");
 
       VisitValue{ OS.bodyContent }.append(BodyItems::AdditionalImplementations,
         "DEFINE_VECTOR(" + newClassName + ")\r\n");
@@ -551,6 +565,7 @@ public:
       }
 
       constructorBody <<
+        "  result->destructor = &" + newClassName + "_destroy;\r\n"
         "  result->origin = origin;\r\n"
         "  return result;\r\n"
         "};\r\n";
@@ -637,16 +652,16 @@ public:
           }
 
           string returnType;
-          if (cType.isPointer)
+          if (cType.isResultPointer)
           {
             returnType = cType.mappedType + "* ";
-            functionHeader << "__declspec(dllexport) const " << returnType << mappedFunctionName << "(";
+            functionHeader << ClassPrefix << "DECLSPEC const " << returnType << mappedFunctionName << "(";
             functionBody << "const " << cType.mappedType << "* " << mappedFunctionName << "(";
           }
           else
           {
             returnType = cType.mappedType.empty() ? string("void") : cType.mappedType;
-            functionHeader << "__declspec(dllexport) " << returnType << " " << mappedFunctionName << "(";
+            functionHeader << ClassPrefix << "DECLSPEC " << returnType << " " << mappedFunctionName << "(";
             functionBody << returnType << " " << mappedFunctionName << "(";
           }
 
@@ -686,7 +701,7 @@ public:
             {
               parameters.push_back("const " + pType.mappedType + "& " + parameterName);
             }
-            else if (pType.mappedType == "char" || (pType.isPointer && !pType.isReference && pType.isConstant))
+            else if (pType.mappedType == "char" || (pType.isResultPointer && !pType.isReference && pType.isConstant))
             {
               parameters.push_back("const " + pType.mappedType + "* " + parameterName);
               parametersCall.push_back(parameterName);
@@ -732,7 +747,7 @@ public:
           if (!cType.isVoid)
           {
             functionBody << "  " << ((cType.isPOD || cType.isEnum) ? string() : constness) <<
-              ((cType.isPointer || cType.isPOD || cType.isEnum)? "auto " : "auto& ") << "value = ";
+              ((!cType.isReference || cType.isPOD || cType.isEnum)? "auto " : "auto& ") << "value = ";
           }
 
           if (method->isStatic())
@@ -787,14 +802,39 @@ public:
 
               if (cType.isReference)
               {
-                functionBody <<
-                  "  return " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\r\n";
+                if (cType.mappedType == "R2M_Point2DInt" || cType.mappedType == "R2M_Point2DFloat")
+                {
+                  functionBody <<
+                    "  auto result = " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\r\n" <<
+                    "  result->x = value.X;\r\n" <<
+                    "  result->y = value.Y;\r\n";
+                }
+                else
+                {
+                  functionBody <<
+                    "  auto result = " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\r\n";
+                }
               }
               else
               {
-                functionBody <<
-                  "  return (value != nullptr)? " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value) : nullptr;\r\n";
+                if (cType.isOriginalPointer)
+                {
+                  functionBody <<
+                    "  auto result = (value != nullptr)? " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(value) : nullptr;\r\n";
+                }
+                else
+                {
+                  functionBody <<
+                    "  auto result = (value != nullptr)? " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value) : nullptr;\r\n";
+                }
               }
+
+              functionBody <<
+                "  if (result)\r\n" <<
+                "  {\r\n" <<
+                "    const_cast<" << cType.mappedType << "*>(result)->destructor = &" + cType.mappedType + "_destroy;\r\n" <<
+                "  }\r\n" << 
+                "  return result;\r\n";
             }
           }
           else // isVoid
@@ -913,6 +953,7 @@ public:
       "\r\n";
 
     OS.headerContent[HeaderItems::CommonIncludeFiles] = 
+      "#include \"" + ClassPrefix + "Config.h\"\r\n"
       "#include \"" + ClassPrefix + "MacroHelper.h\"\r\n"
       "\r\n"
       "#ifdef __cplusplus\r\n"
@@ -948,6 +989,16 @@ public:
 
     OS.bodyContent[BodyItems::Usings] =
       vector<string>{ "using namespace " + R2NameSpace + ";\r\n" };
+
+    OS.bodyContent[BodyItems::ExternCBegin] =
+      "#ifdef __cplusplus \r\n"
+      "extern \"C\" { \r\n"
+      "#endif \r\n";
+
+    OS.bodyContent[BodyItems::ExternCEnd] =
+      "#ifdef __cplusplus \r\n"
+      "} \r\n"
+      "#endif \r\n";
 
     return true;
   }
