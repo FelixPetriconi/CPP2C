@@ -137,6 +137,16 @@ namespace
 
   }
 
+  string stripConst(std::string type)
+  {
+    auto pos = type.find("const ");
+    if (pos != string::npos)
+    {
+      type = type.substr(pos + 6, type.size() - pos);
+    }
+    return type;
+  }
+
 
   string currentFile;
   string originalSourceFile;
@@ -314,7 +324,7 @@ public:
         }
         else
         {
-          result.mappedType = qt.getAsString();
+          result.mappedType = qt.getAsString() == string("const char *")? qt.getAsString() : stripConst(qt.getAsString());
           result.originalType = qt.getAsString();
         }
       }
@@ -333,7 +343,7 @@ public:
       auto enumType = qt->getAs<EnumType>()->getDecl();
       result.originalType = enumType->getNameAsString();
       result.declarationSourceFile = sourceManager.getFilename(enumType->getLocation()).str();
-      result.mappedType = ClassPrefix + enumType->getNameAsString();
+      result.mappedType = ClassPrefix + stripConst(enumType->getNameAsString());
       result.static_cast_needed = true;
       result.isEnum = true;
 
@@ -654,9 +664,9 @@ public:
           string returnType;
           if (cType.isResultPointer)
           {
-            returnType = cType.mappedType + "* ";
-            functionHeader << ClassPrefix << "DECLSPEC const " << returnType << mappedFunctionName << "(";
-            functionBody << "const " << cType.mappedType << "* " << mappedFunctionName << "(";
+            returnType = "const " + cType.mappedType + "* ";
+            functionHeader << ClassPrefix << "DECLSPEC " << returnType << mappedFunctionName << "(";
+            functionBody << returnType << mappedFunctionName << "(";
           }
           else
           {
@@ -738,15 +748,26 @@ public:
 
           stringstream functionCall;
 
-          functionBody << allParameters << ")\r\n"
-            << "{\r\n";
+          functionBody << allParameters << ")\r\n" <<
+            "{\r\n";
+
+          if (!cType.isVoid)
+          {
+            functionBody <<
+              "  " << returnType << " result " << (cType.isResultPointer? " = nullptr" : "") << ";\r\n";
+          }
+
+          functionBody <<
+            "  try\r\n" <<
+            "  {\r\n";
+
 
           additionalVariables.flush();
           functionBody << additionalVariables.str();
 
           if (!cType.isVoid)
           {
-            functionBody << "  " << ((cType.isPOD || cType.isEnum) ? string() : constness) <<
+            functionBody << "    " << ((cType.isPOD || cType.isEnum) ? string() : constness) <<
               ((!cType.isReference || cType.isPOD || cType.isEnum)? "auto " : "auto& ") << "value = ";
           }
 
@@ -760,12 +781,12 @@ public:
             if (method->isConst())
             {
               functionBody <<
-                "  reinterpret_cast<const " << originalClassName << "*>(self->origin)->" << originalFunctionName << "(";
+                "    reinterpret_cast<const " << originalClassName << "*>(self->origin)->" << originalFunctionName << "(";
             }
             else
             {
               functionBody <<
-                "  reinterpret_cast<" << originalClassName << "*>(const_cast<void*>(self->origin))->" << originalFunctionName << "(";
+                "    reinterpret_cast<" << originalClassName << "*>(const_cast<void*>(self->origin))->" << originalFunctionName << "(";
             }
           }
 
@@ -776,65 +797,48 @@ public:
           {
             if (cType.static_cast_needed)
             {
-              functionBody << "  return static_cast<" << cType.mappedType << ">(value);\r\n";
+              functionBody << 
+                "    result = static_cast<" << cType.mappedType << ">(value);\r\n";
             }
             else if (cType.mappedType == "char")
             {
               appendUnique(get<Strings>(OS.headerContent[HeaderItems::AdditionalIncludeFiles]), "#include \"" + ClassPrefix + "StringHelper.h" + "\"");
-              functionBody << "  return " << ClassPrefix << "allocateAndCopyString(value.c_str());\r\n";
+              functionBody << 
+                "    result = " << ClassPrefix << "allocateAndCopyString(value.c_str());\r\n";
             }
             else if (cType.isVector)
             {
               functionBody <<
-                "  using OriginType = decltype(value);\r\n" <<
-                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\r\n " <<
-                "  return " << ClassPrefix << "SCR::createWrappedObjectArray<PureType, " << cType.mappedType << ">(value);\r\n";
+                "    using OriginType = decltype(value);\r\n" <<
+                "    using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\r\n";
+              functionBody << 
+                "    result = " << ClassPrefix << "SCR::createWrappedObjectArray<PureType, " << cType.mappedType << ">(value);\r\n";
             }
-            else if (cType.isPOD)
+            else if (cType.isPOD || cType.isEnum)
             {
-              functionBody << "  return value;\r\n";
+              functionBody <<
+                "    result = value;\r\n";
             }
             else
             {
-              functionBody <<
-                "  using OriginType = decltype(value);\r\n" <<
-                "  using PureType = std::remove_reference_t<std::remove_const_t<OriginType>>;\r\n ";
-
               if (cType.isReference)
               {
-                if (cType.mappedType == "R2M_Point2DInt" || cType.mappedType == "R2M_Point2DFloat")
-                {
-                  functionBody <<
-                    "  auto result = " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\r\n" <<
-                    "  result->x = value.X;\r\n" <<
-                    "  result->y = value.Y;\r\n";
-                }
-                else
-                {
-                  functionBody <<
-                    "  auto result = " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value);\r\n";
-                }
+                functionBody <<
+                  "    result = " << cType.mappedType << "_create(&value);\r\n";
               }
               else
               {
                 if (cType.isOriginalPointer)
                 {
                   functionBody <<
-                    "  auto result = (value != nullptr)? " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(value) : nullptr;\r\n";
+                    "    result = (value != nullptr)? " << cType.mappedType << "_create(value) : nullptr;\r\n";
                 }
                 else
                 {
                   functionBody <<
-                    "  auto result = (value != nullptr)? " << ClassPrefix << "SCR::createWrappedObject<PureType, " << cType.mappedType << ">(&value) : nullptr;\r\n";
+                    "    result = (value != nullptr)? " << cType.mappedType << "_create(&value) : nullptr;\r\n";
                 }
               }
-
-              functionBody <<
-                "  if (result)\r\n" <<
-                "  {\r\n" <<
-                "    const_cast<" << cType.mappedType << "*>(result)->destructor = &" + cType.mappedType + "_destroy;\r\n" <<
-                "  }\r\n" << 
-                "  return result;\r\n";
             }
           }
           else // isVoid
@@ -844,6 +848,22 @@ public:
               returnByReference.str();
           }
 
+          functionBody <<
+            "  }\r\n" <<
+            "  catch(const DecodingFailedException& e)\r\n" <<
+            "  {\r\n" <<
+            "    " << ClassPrefix << "decodingFailed(e.what()); \r\n" <<
+            "  }\r\n" <<
+            "  catch(const InvalidInputException& e)\r\n" <<
+            "  {\r\n" <<
+            "    " << ClassPrefix << "invalidInput(e.what()); \r\n" <<
+            "  }\r\n";
+
+          if (!cType.isVoid)
+          {
+            functionBody <<
+              "  return result;\r\n";
+          }
           functionBody <<
             "}\r\n";
           
@@ -982,10 +1002,15 @@ public:
 
     OS.bodyContent[BodyItems::CommonIncludeFiles] =
       "#include \"" + ClassPrefix + "TemplateHelper.h\"\r\n"
+      "#include \"" + ClassPrefix + "ErrorHandler.h\"\r\n"
       "\r\n";
 
     OS.bodyContent[BodyItems::AdditionalIncludeFiles] =
-      vector<string>{ "#include <"+ ThirdpartyInclude +"/" + stripPathFromFileName(_originalIncludeFileName) + ">\r\n" };
+      vector<string>{ 
+        "#include <" + ThirdpartyInclude +"/" + stripPathFromFileName(_originalIncludeFileName) + ">\r\n",
+        "#include <" + ThirdpartyInclude + "/DecodingFailedException.h>\r\n",
+        "#include <" + ThirdpartyInclude + "/InvalidInputException.h>\r\n"
+      };
 
     OS.bodyContent[BodyItems::Usings] =
       vector<string>{ "using namespace " + R2NameSpace + ";\r\n" };
